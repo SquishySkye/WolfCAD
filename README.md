@@ -84,7 +84,9 @@ Tests:
 
 ## Unterstützen
 
-Fehlerberichte und Ideen sind sehr willkommen – einfach ein [Issue](../../issues) anlegen.
+Wenn dir WolfCAD gefällt und du die Entwicklung unterstützen möchtest, freue ich mich über einen Kaffee auf
+[**Ko-fi**](https://ko-fi.com/squishyskye) ☕ – danke! Fehlerberichte und Ideen sind genauso willkommen: einfach ein
+[Issue](../../issues) anlegen.
 
 ## Lizenz
 
