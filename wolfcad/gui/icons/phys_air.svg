@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Luftströmung: Stromlinien um einen Tropfen -->
+<path d="M13 16C13 12 17 11 21 13C24 14.5 27 16 27 16C27 16 24 17.5 21 19C17 21 13 20 13 16Z" stroke="#d6dbe4"/>
+<path d="M3 9C9 9 12 8 17 8S25 9 29 9M3 23C9 23 12 24 17 24S25 23 29 23M3 16H10" stroke="#8fd3ff"/>
+</svg>

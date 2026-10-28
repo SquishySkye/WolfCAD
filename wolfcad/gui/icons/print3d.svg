@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- 3D-Druck (selbst gezeichnet): Druckkopf über einem Bett, darunter ein Objekt aus Schichten -->
+<path d="M5 27H27" stroke="#c8ccd4"/>
+<path d="M10 24H22M11 21H21M12 18H20" stroke="#5aa9ff"/>
+<path d="M12 5H20V10L16 14L12 10Z" stroke="#c8ccd4"/>
+<path d="M6 5H26" stroke="#c8ccd4"/>
+</svg>

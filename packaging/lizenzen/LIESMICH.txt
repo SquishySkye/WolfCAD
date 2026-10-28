@@ -1,0 +1,9 @@
+Vollständige Lizenztexte der mitgelieferten Programme und Bibliotheken (Übersicht in LIZENZEN.txt).
+
+AGPL-3.0_Creality-Print.txt   Creality Print 7.3.0 (Slicer)
+gmsh_LICENSE.txt, GPL-2.0.txt gmsh 4.15.2 (GPL-2.0-or-later mit Ausnahme); gmsh_CREDITS.txt nennt die in gmsh
+                              enthaltenen Fremdbibliotheken und ihre Lizenzen
+LGPL-3.0_Qt-PySide6.txt       Qt 6 / PySide6 / shiboken6 6.12.0 (zusammen mit der GPL-3.0 in LICENSE)
+OCCT_LGPL-2.1.txt,            OpenCASCADE 8.0.1 (in cadquery-ocp), LGPL-2.1 mit Zusatzausnahme
+OCCT_LGPL_EXCEPTION.txt
+Weitere Texte liegen bei den Paketen selbst (*.dist-info, Python: lib/python3.14/LICENSE.txt).

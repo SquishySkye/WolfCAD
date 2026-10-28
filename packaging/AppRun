@@ -1,0 +1,11 @@
+#!/bin/sh
+# Start von WolfCAD aus dem AppImage: eigene Python-Laufzeit, Programm unter usr/app, Slicer unter usr/crealityprint.
+HERE="$(dirname "$(readlink -f "$0")")"
+export PYTHONPATH="$HERE/usr/app"
+export PYTHONNOUSERSITE=1                       # keine Pakete aus dem Benutzerverzeichnis untermischen
+export PYTHONDONTWRITEBYTECODE=1                # das AppImage ist schreibgeschützt
+export WOLFCAD_CREALITY="${WOLFCAD_CREALITY:-$HERE/usr/crealityprint}"
+export WOLFCAD_APPIMAGE=1
+# Wayland bevorzugen, sonst X11 (wie Qt selbst, aber auch ohne gesetzte Variable)
+if [ -z "$QT_QPA_PLATFORM" ] && [ -n "$WAYLAND_DISPLAY" ]; then export QT_QPA_PLATFORM="wayland;xcb"; fi
+exec "$HERE/usr/python/bin/python3" -m wolfcad "$@"

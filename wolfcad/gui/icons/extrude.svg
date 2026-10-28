@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<polygon points="16,17 26,22 16,27 6,22" stroke="#5aa9ff"/><polygon points="16,5 26,10 16,15 6,10" stroke="#d6dbe4"/><path d="M6 10v12M26 10v12M16 15v12" stroke="#7b8496"/><path d="M29 20V8M26 11l3-3 3 3" stroke="#f0c040" transform="translate(-1,0)"/>
+</svg>

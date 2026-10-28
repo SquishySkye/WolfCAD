@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Druck: mehrere gleich lange Pfeile senkrecht auf eine Fläche -->
+<path d="M4 25L11 20H28L21 25Z" stroke="#d6dbe4"/>
+<path d="M10 6V16M7.5 13.5L10 16L12.5 13.5M17 6V16M14.5 13.5L17 16L19.5 13.5M24 6V16M21.5 13.5L24 16L26.5 13.5" stroke="#ff8c26"/>
+</svg>

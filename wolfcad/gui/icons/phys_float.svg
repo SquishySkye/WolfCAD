@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Schwimmen: Boot auf der Wasserlinie -->
+<path d="M6 14H26L22 21H10Z" stroke="#d6dbe4"/><path d="M16 14V5L22 11H16" stroke="#d6dbe4"/>
+<path d="M3 20Q6 17.5 9 20T15 20T21 20T27 20T30 20M3 26Q6 23.5 9 26T15 26T21 26T27 26" stroke="#3a8dff"/>
+</svg>

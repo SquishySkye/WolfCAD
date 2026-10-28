@@ -1,0 +1,18 @@
+# Entwicklungsumgebung und Zwischenstände
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Nur lokal (nicht veröffentlichen):
+# – Entwicklungstagebuch mit privaten Angaben (Gerätenamen, Adressen, Pfade)
+ENTWICKLUNG.md
+# – Werkzeug, das die .f3d-Klassenzuordnung aus einer Fusion-Installation ausliest (siehe wolfcad/f3d/schema.py)
+wolfcad/f3d/schema_extract.py
+# – erzeugte Klassenzuordnung, falls sie je im Projektordner landet
+fusion_schema.json
+
+# Bauergebnisse
+*.AppImage
+build/
+dist/

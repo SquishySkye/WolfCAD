@@ -1,0 +1,125 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Windows-Installer bauen und prüfen; bei einem Versions-Tag (v2026.10.28 …) zusammen mit den Quelltexten der
+# mitgelieferten GPL/AGPL-Programme an das Release hängen. Das Linux-AppImage wird lokal mit
+# packaging/build_appimage.sh gebaut und von Hand hochgeladen.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:          # auch von Hand startbar (dann nur bauen und als Artefakt ablegen)
+
+permissions:
+  contents: write             # zum Hochladen an das Release
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fassung bestimmen
+        shell: pwsh
+        run: |
+          # aus dem Tag (v2026.10.28 -> 2026.10.28), sonst aus wolfcad/__init__.py
+          if ($env:GITHUB_REF_TYPE -eq "tag") { $v = $env:GITHUB_REF_NAME.TrimStart("v") }
+          else { $v = (Select-String -Path wolfcad\__init__.py -Pattern '__version__ = "(.+)"').Matches[0].Groups[1].Value }
+          "VERSION=$v" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Programmordner zusammenstellen
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging\windows\build_windows.ps1 -Ausgabe build\windows
+
+      - name: Rauchtest und echtes Slicen mit dem Paket
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONNOUSERSITE: "1"
+        run: |
+          $root = "build\windows\WolfCAD"
+          $env:PYTHONPATH = (Resolve-Path "$root\app").Path
+          $env:WOLFCAD_CREALITY = (Resolve-Path "$root\crealityprint").Path
+          & "$root\python\python.exe" packaging\probe\rauchtest.py
+          if ($LASTEXITCODE -ne 0) { throw "Rauchtest fehlgeschlagen" }
+          & "$root\python\python.exe" packaging\probe\slicetest.py
+          if ($LASTEXITCODE -ne 0) { throw "Slicetest fehlgeschlagen" }
+
+      - name: Unit-Tests mit der Paket-Laufzeit
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $py = "build\windows\WolfCAD\python\python.exe"
+          & $py -m pip install --quiet --target build\testpakete pytest
+          $env:PYTHONPATH = "$PWD;$PWD\build\testpakete"
+          & $py -m pytest -q -p no:cacheprovider tests
+          if ($LASTEXITCODE -ne 0) { throw "Unit-Tests fehlgeschlagen" }
+
+      - name: Installer bauen (Inno Setup)
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress; }
+          & $iscc /Q "/DVersion=$env:VERSION" "/DQuelle=$PWD\build\windows\WolfCAD" "/DAusgabe=$PWD\build\windows" packaging\windows\wolfcad.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup fehlgeschlagen" }
+
+      - name: Installer prüfen (still installieren, Rauchtest und echter Fensterstart)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $setup = (Get-Item build\windows\WolfCAD-*-Windows-Setup.exe).FullName
+          $dir = "$env:RUNNER_TEMP\WolfCAD-Test"
+          Start-Process -Wait -FilePath $setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/NORESTART", "/DIR=$dir"
+          if (-not (Test-Path "$dir\WolfCAD.pyw")) { throw "Installation unvollständig" }
+          $env:PYTHONPATH = "$dir\app"
+          $env:WOLFCAD_CREALITY = "$dir\crealityprint"
+          & "$dir\python\python.exe" packaging\probe\rauchtest.py
+          if ($LASTEXITCODE -ne 0) { throw "Rauchtest der Installation fehlgeschlagen" }
+          # wie über den Startmenü-Eintrag: pythonw.exe mit dem Startskript, 20 s laufen lassen
+          Remove-Item Env:PYTHONPATH, Env:WOLFCAD_CREALITY
+          $app = Start-Process -PassThru -FilePath "$dir\python\pythonw.exe" -ArgumentList "`"$dir\WolfCAD.pyw`""
+          Start-Sleep -Seconds 20
+          if ($app.HasExited) { throw "WolfCAD hat sich nach dem Start beendet (Code $($app.ExitCode))" }
+          Stop-Process -Id $app.Id
+          $log = "$env:LOCALAPPDATA\WolfCAD\fehler.log"
+          if ((Test-Path $log) -and (Select-String -Path $log -Pattern "Traceback" -Quiet)) { Get-Content $log; throw "Fehler beim Start" }
+          Write-Host "INSTALLER OK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WolfCAD-Windows-Setup
+          path: build/windows/WolfCAD-*-Windows-Setup.exe
+
+      - name: An das Release hängen
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:GITHUB_REF_NAME 2>$null
+          if ($LASTEXITCODE -ne 0) { gh release create $env:GITHUB_REF_NAME --title "WolfCAD $env:VERSION" --notes "Siehe README." }
+          gh release upload $env:GITHUB_REF_NAME (Get-Item build\windows\WolfCAD-*-Windows-Setup.exe).FullName --clobber
+
+  quelltexte:
+    # GPL/AGPL verlangen, dass zu weitergegebenen Programmen der Quelltext erreichbar ist – deshalb liegt er in genau
+    # der mitgelieferten Fassung auch am Release (nicht nur als Verweis auf fremde Seiten)
+    if: github.ref_type == 'tag'
+    needs: windows            # erst danach: das Release legt der Windows-Teil an
+    runs-on: ubuntu-latest
+    steps:
+      - name: Quelltexte laden und anhängen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -e
+          curl -fsSL -o CrealityPrint-7.3.0-Quelltext.tar.gz \
+            https://github.com/CrealityOfficial/CrealityPrint/archive/refs/tags/v7.3.0.tar.gz
+          curl -fsSL -o gmsh-4.15.2-Quelltext.tgz https://gmsh.info/src/gmsh-4.15.2-source.tgz
+          sha256sum *.tar.gz *.tgz > Quelltexte-SHA256SUMS.txt
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 || \
+            gh release create "$GITHUB_REF_NAME" --title "WolfCAD ${GITHUB_REF_NAME#v}" --notes "Siehe README."
+          gh release upload "$GITHUB_REF_NAME" CrealityPrint-7.3.0-Quelltext.tar.gz gmsh-4.15.2-Quelltext.tgz \
+            Quelltexte-SHA256SUMS.txt --clobber

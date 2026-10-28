@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Festigkeit: gebogener Balken mit Spannungsfarben, eingespannt -->
+<path d="M4 6V26" stroke="#d6dbe4"/><path d="M5 11C14 11 22 13 28 19" stroke="#3f7fff" stroke-width="5"/>
+<path d="M5 11C10 11 13 11.4 16 12" stroke="#f25252" stroke-width="5"/><path d="M16 12C19 12.8 22 14 24 15.5" stroke="#f0c040" stroke-width="5"/>
+</svg>

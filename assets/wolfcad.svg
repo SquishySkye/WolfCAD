@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Programmsymbol von WolfCAD: ein Würfel in Schrägansicht mit hervorgehobener Kante -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="24" fill="#262a33"/>
+  <polygon points="64,20 106,42 64,64 22,42" fill="#a9b4c6"/>
+  <polygon points="22,42 64,64 64,110 22,88" fill="#6c7689"/>
+  <polygon points="106,42 64,64 64,110 106,88" fill="#868fa3"/>
+  <polyline points="22,42 64,64 106,42" fill="none" stroke="#f0c040" stroke-width="5" stroke-linejoin="round" stroke-linecap="round"/>
+  <line x1="64" y1="64" x2="64" y2="110" stroke="#f0c040" stroke-width="5" stroke-linecap="round"/>
+</svg>

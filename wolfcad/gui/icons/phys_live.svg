@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Live neu rechnen: Kreispfeile um eine Farbskala -->
+<path d="M26 12A11 11 0 0 0 6.5 9M6 20A11 11 0 0 0 25.5 23" stroke="#d6dbe4"/>
+<path d="M6.5 4V9H11.5M25.5 28V23H20.5" stroke="#d6dbe4"/><path d="M12 19V16M16 19V13M20 19V15" stroke="#f0c040"/>
+</svg>

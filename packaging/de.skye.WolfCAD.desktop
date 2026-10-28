@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=WolfCAD
+GenericName=3D-CAD
+Comment=Parametrisches 3D-CAD mit Timeline, Fusion-Import, 3D-Druck und Physik-Tests
+Exec=WolfCAD %F
+Icon=de.skye.WolfCAD
+Terminal=false
+Categories=Graphics;3DGraphics;Engineering;
+Keywords=CAD;3D;Konstruktion;Fusion;Druck;
+MimeType=model/step;application/x-wolfcad;
+StartupWMClass=de.skye.WolfCAD

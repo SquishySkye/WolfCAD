@@ -1,0 +1,39 @@
+WolfCAD – Lizenz und mitgelieferte Programme
+============================================
+
+WolfCAD selbst: Copyright (C) 2026 Skye und die WolfCAD-Mitwirkenden
+  Lizenz: GNU General Public License v3.0 oder später (GPL-3.0-or-later), Text in der Datei LICENSE.
+  Alle Abhängigkeiten unten sind mit der GPL-3.0 vereinbar (Apache-2.0, LGPL, BSD/MIT, GPL-2.0-or-later);
+  Creality Print ist ein eigenständiges Programm unter AGPL-3.0, das WolfCAD aufruft (GPL-3.0 §13).
+
+Creality Print 7.3.0 (Slicer; AppImage: usr/crealityprint, Windows: crealityprint\)
+  Lizenz: GNU Affero General Public License v3.0 (AGPL-3.0)
+  Unverändert mitgeliefert, entpackt aus den offiziellen Paketen des Releases v7.3.0:
+    Linux:   CrealityPrint-V7.3.0.6157-x86_64-Release.AppImage
+    Windows: crealityprint-7.3.0-release-full.nupkg (ohne Selbst-Aktualisierung und Explorer-Erweiterung)
+  WolfCAD ruft es als eigenes Programm über die Kommandozeile auf.
+  Quelltext: https://github.com/CrealityOfficial/CrealityPrint (Tag v7.3.0); eine Kopie dieses Quelltexts
+  (CrealityPrint-7.3.0-Quelltext.tar.gz) liegt jedem WolfCAD-Release auf GitHub bei.
+
+Python 3.14 (python-build-standalone)  – PSF-Lizenz, https://github.com/astral-sh/python-build-standalone
+OCP / cadquery-ocp (OpenCASCADE)       – Apache-2.0 bzw. LGPL-2.1 (OCCT), https://github.com/CadQuery/OCP
+vtk (Teile, von OCP gebraucht)         – BSD-3-Clause, https://vtk.org
+PySide6 / Qt 6                         – LGPL-3.0, https://www.qt.io/qt-for-python
+numpy                                  – BSD-3-Clause
+scipy                                  – BSD-3-Clause
+gmsh                                   – GPL-2.0-or-later, https://gmsh.info
+                                         (Quelltext 4.15.2 liegt jedem Release bei)
+Pillow                                 – MIT-CMU (HPND)
+Inno Setup (nur Windows-Installer)     – eigene freie Lizenz, https://jrsoftware.org/files/is/license.txt
+
+Die vollständigen Lizenztexte von Creality Print, gmsh, Qt/PySide6 und OpenCASCADE liegen im Ordner „lizenzen“
+(im AppImage usr/app/lizenzen, unter Windows app\lizenzen); weitere stehen in den *.dist-info-Ordnern der Pakete (AppImage:
+usr/python/lib/python3.14/site-packages, Windows: python\Lib\site-packages) und bei Creality Print in
+usr/crealityprint/usr/share/licenses bzw. crealityprint\LICENSE.txt.
+
+Quelltexte der Bibliotheken unter LGPL (Qt/PySide6 6.12.0, OpenCASCADE über cadquery-ocp 8.0.1.1.0) gibt es in genau
+diesen Fassungen bei https://download.qt.io/official_releases/QtForPython/ bzw. https://github.com/CadQuery/OCP und
+https://github.com/Open-Cascade-SAS/OCCT. Die Bibliotheken liegen als eigene, austauschbare Dateien im Paket.
+
+Marken: Autodesk und Fusion sind Marken der Autodesk, Inc.; Creality und Creality Print sind Marken von Shenzhen
+Creality 3D Technology Co., Ltd. WolfCAD steht mit keinem dieser Unternehmen in Verbindung.

@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<path d="M7 27C7 14 14 8 26 8" stroke="#f0c040" stroke-dasharray="3 3"/><ellipse cx="7" cy="26" rx="5" ry="2.5" stroke="#5aa9ff"/><ellipse cx="25" cy="8" rx="2.5" ry="5" stroke="#5aa9ff"/><path d="M2 26C2 12 12 3 25 3M12 26C12 18 17 13 25 13" stroke="#c8ccd4"/>
+</svg>

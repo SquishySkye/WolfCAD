@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Ergebnis aus: Farbskala durchgestrichen -->
+<rect x="6" y="6" width="20" height="20" rx="3" stroke="#d6dbe4"/>
+<path d="M10 22V18M14 22V14M18 22V16M22 22V11" stroke="#f0c040"/><path d="M6 26L26 6" stroke="#f25252"/>
+</svg>

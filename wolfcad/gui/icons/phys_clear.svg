@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Lasten entfernen: Pfeil durchgestrichen -->
+<path d="M5 24L13 19H28L20 24Z" stroke="#d6dbe4"/><path d="M17 3V15M13 11L17 15L21 11" stroke="#ff8c26"/>
+<path d="M7 5L27 27" stroke="#f25252"/>
+</svg>
