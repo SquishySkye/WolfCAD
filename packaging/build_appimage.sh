@@ -14,7 +14,9 @@ WERKZEUGE="${WERKZEUGE:-$HOME/Coding/Dateien/wolfcad/paket/werkzeuge}"
 CREALITY="${CREALITY:-$HOME/Coding/Dateien/wolfcad/crealityprint}"
 PYTHON_ARCHIV="$(ls "$WERKZEUGE"/cpython-3.14*-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz | head -1)"
 APPDIR="$AUSGABE/WolfCAD.AppDir"
-VERSION="$(date +%Y.%m.%d)"
+# Fassung aus dem Programm (wolfcad/__init__.py), nicht aus dem Datum – sonst passt der Dateiname nach Mitternacht
+# nicht mehr zum Release
+VERSION="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$PROJEKT/wolfcad/__init__.py")"
 
 # Laufzeit-Pakete mit festen Fassungen (wie in der Entwicklungsumgebung geprüft). Qt nur die Grundmodule
 # (PySide6-Essentials). vtk braucht OCP für einige seiner Bibliotheken – davon bleiben unten nur diese übrig.
