@@ -32,16 +32,25 @@ def plain_system(monkeypatch):
     theme.apply(app, theme.SYSTEM, remember=False)
 
 
+def _set_scheme(scheme) -> None:
+    """Stellt einen Wechsel hell/dunkel des Systems nach; kann die Qt-Plattform das nicht (z. B. „offscreen“ unter
+    Windows), wird der Test übersprungen – in GitHub Actions läuft er unter Windows deshalb mit der echten Plattform."""
+    app.styleHints().setColorScheme(scheme)
+    app.processEvents()
+    if app.styleHints().colorScheme() != scheme:
+        pytest.skip("diese Qt-Plattform kann einen Wechsel hell/dunkel nicht nachstellen")
+
+
 def _window_lightness() -> int:
     return QColor(theme.current().extra["colours"]["window"]).lightness()
 
 
 def test_system_design_follows_light_and_dark(plain_system):
-    app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    _set_scheme(Qt.ColorScheme.Dark)
     theme.apply(app, theme.SYSTEM, remember=False)
     assert _window_lightness() < 128
     dark_view = theme.current().background
-    app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    _set_scheme(Qt.ColorScheme.Light)
     theme.apply(app, theme.SYSTEM, remember=False)
     assert _window_lightness() > 128
     # auch die Anwendung selbst und die 3D-Ansicht sind hell geworden
@@ -53,10 +62,10 @@ def test_system_design_follows_light_and_dark(plain_system):
 
 def test_palette_is_read_fresh_each_time(plain_system):
     # vorher galt immer die Palette vom Programmstart – jetzt die gerade aktuelle des Systems
-    app.styleHints().setColorScheme(Qt.ColorScheme.Light)
+    _set_scheme(Qt.ColorScheme.Light)
     theme.apply(app, theme.SYSTEM, remember=False)
     first = theme.current().extra["colours"]["window"]
-    app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    _set_scheme(Qt.ColorScheme.Dark)
     theme.apply(app, theme.SYSTEM, remember=False)
     assert theme.current().extra["colours"]["window"] != first
 
@@ -65,18 +74,19 @@ def test_watcher_reports_scheme_change_and_theme_event(plain_system):
     watcher = theme.SystemWatcher(app)
     seen = []
     watcher.changed.connect(lambda: seen.append(1))
-    app.styleHints().setColorScheme(
-        Qt.ColorScheme.Light if app.styleHints().colorScheme() != Qt.ColorScheme.Light else Qt.ColorScheme.Dark)
-    QTest.qWait(500)
-    assert len(seen) == 1                     # gebündelt: eine Meldung
     QCoreApplication.sendEvent(app, QEvent(QEvent.Type.ThemeChange))     # neue Systemfarben (z. B. Akzent)
     QTest.qWait(500)
-    assert len(seen) == 2
+    assert len(seen) == 1
     # das eigene Umfärben löst keine Meldung aus (sonst bauten sich Design und Meldung endlos gegenseitig neu)
     theme.apply(app, theme.SYSTEM, remember=False)
     QTest.qWait(500)
-    assert len(seen) == 2
+    assert len(seen) == 1
+    # Wechsel hell/dunkel: gebündelt eine Meldung
+    _set_scheme(Qt.ColorScheme.Light if app.styleHints().colorScheme() != Qt.ColorScheme.Light
+                else Qt.ColorScheme.Dark)
+    QTest.qWait(500)
     watcher.deleteLater()
+    assert len(seen) == 2
 
 
 def test_accent_comes_from_system(plain_system):

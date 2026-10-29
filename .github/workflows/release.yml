@@ -56,6 +56,16 @@ jobs:
           & $py -m pytest -q -p no:cacheprovider tests
           if ($LASTEXITCODE -ne 0) { throw "Unit-Tests fehlgeschlagen" }
 
+      - name: Design folgt dem System (mit der echten Windows-Plattform statt „offscreen“)
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: windows
+        run: |
+          $py = "build\windows\WolfCAD\python\python.exe"
+          $env:PYTHONPATH = "$PWD;$PWD\build\testpakete"
+          & $py -m pytest -q -p no:cacheprovider -rs tests\test_theme_system.py
+          if ($LASTEXITCODE -ne 0) { throw "Design-Tests unter Windows fehlgeschlagen" }
+
       - name: Installer bauen (Inno Setup)
         shell: pwsh
         run: |
