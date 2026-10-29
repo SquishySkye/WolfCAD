@@ -928,6 +928,9 @@ class MainWindow(QMainWindow):
         self._colour_watch.fileChanged.connect(lambda path: QTimer.singleShot(200, lambda: self._desktop_colours_changed(path)))
         self._colour_watch.directoryChanged.connect(
             lambda _folder: QTimer.singleShot(200, lambda: self._desktop_colours_changed(None)))
+        # Aussehen des Betriebssystems (hell/dunkel, Akzentfarbe – Linux wie Windows): auch dem folgt „System“ sofort
+        self._system_watch = theme.SystemWatcher(QApplication.instance(), self)
+        self._system_watch.changed.connect(lambda: self._desktop_colours_changed(None))
         self._vertex_cache: dict[str, tuple] = {}       # Körpername -> (Kennung der Form, Eckpunkte)
         # Körpername -> je fangbarem Punkt, wie weit er hinter der Fläche liegen darf (0 = Ecke, Radius = Kreismitte)
         self._vertex_depth: dict[str, np.ndarray] = {}
@@ -968,7 +971,7 @@ class MainWindow(QMainWindow):
         self._refresh(fit=True)
 
     def _desktop_colours_changed(self, path: str | None) -> None:
-        """Die Shell hat ihr Farbschema geändert: im Design „System“ zieht das Programm sofort nach."""
+        """Shell oder Betriebssystem haben ihr Farbschema geändert: im Design „System“ zieht das Programm sofort nach."""
         # manche Programme ersetzen die Datei, dann endet ihre Beobachtung; neu angelegte Dateien kommen dazu
         for watched in [*theme.watched_files(), *theme.watched_folders()]:
             if str(watched) not in [*self._colour_watch.files(), *self._colour_watch.directories()]:

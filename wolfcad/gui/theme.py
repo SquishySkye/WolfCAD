@@ -3,17 +3,23 @@
 """Designs (Themes) der Oberfläche.
 
 „System“ übernimmt Farben und Schrift des Betriebssystems: zuerst die Farben der Noctalia-Shell
-(`~/.config/noctalia/colors.json`), sonst die Farben, die Qt vom Desktop bekommt. „Klassisch“ ist das
-ursprüngliche WolfCAD-Aussehen. Die Wahl wird gemerkt und lässt sich im laufenden Programm wechseln.
+(`~/.config/noctalia/colors.json`), sonst die Farben, die Qt vom Desktop bekommt (hell/dunkel und Akzentfarbe;
+unter Windows die Akzentfarbe aus den Einstellungen). „Klassisch“ ist das ursprüngliche WolfCAD-Aussehen. Die Wahl
+wird gemerkt und lässt sich im laufenden Programm wechseln.
+
+Das Design folgt dem System auch im laufenden Programm: `SystemWatcher` meldet Wechsel zwischen hell und dunkel und
+neue Systemfarben (Qt-Ereignis ThemeChange, unter Windows zusätzlich die Registrierung); die Noctalia-Farbdatei
+beobachtet das Hauptfenster selbst.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from PySide6.QtCore import QSettings
+from PySide6.QtCore import QEvent, QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPalette
 
 SYSTEM, CLASSIC = "System", "Klassisch"
@@ -116,12 +122,62 @@ def _desktop_colours(start: QPalette) -> dict[str, str]:
     except (OSError, ValueError, KeyError):
         pass
     role = QPalette.ColorRole
-    window, text = start.color(role.Window).name(), start.color(role.WindowText).name()
-    accent = start.color(role.Highlight).name()
-    return {"window": window, "surface": start.color(role.Base).name(), "text": text,
-            "muted": _mix(text, window, 0.45), "accent": accent, "on_accent": start.color(role.HighlightedText).name(),
-            "second": accent, "on_second": start.color(role.HighlightedText).name(),
+    window, surface = start.color(role.Window).name(), start.color(role.Base).name()
+    text = start.color(role.WindowText).name()
+    # Meldet das System hell/dunkel anders, als die Palette aussieht (z. B. Windows 10 mit dem klassischen Stil,
+    # der den dunklen Modus nicht zeichnet), gelten neutrale Grundfarben in der gemeldeten Helligkeit
+    scheme = color_scheme()
+    looks_dark = QColor(window).lightness() < 128
+    if scheme == "dunkel" and not looks_dark:
+        window, surface, text = "#1f2126", "#2a2d33", "#e8eaee"
+    elif scheme == "hell" and looks_dark:
+        window, surface, text = "#f3f4f6", "#ffffff", "#1b1d22"
+    accent = _windows_accent() or start.color(role.Accent).name()
+    on_accent = "#10131a" if QColor(accent).lightness() > 150 else "#ffffff"
+    return {"window": window, "surface": surface, "text": text,
+            "muted": _mix(text, window, 0.45), "accent": accent, "on_accent": on_accent,
+            "second": accent, "on_second": on_accent,
             "outline": _mix(window, text, 0.22), "error": "#e05555", "on_error": "#ffffff"}
+
+
+def color_scheme() -> str | None:
+    """Hell oder dunkel laut Betriebssystem („hell“, „dunkel“), None wenn das System nichts meldet."""
+    from PySide6.QtGui import QGuiApplication
+    app = QGuiApplication.instance()
+    if app is None:
+        return None
+    scheme = app.styleHints().colorScheme()
+    return {Qt.ColorScheme.Dark: "dunkel", Qt.ColorScheme.Light: "hell"}.get(scheme)
+
+
+def _windows_accent() -> str | None:
+    """Akzentfarbe aus den Windows-Einstellungen (Personalisierung → Farben), sonst None.
+
+    Steht als DWORD im Format 0xAABBGGRR unter HKCU\\Software\\Microsoft\\Windows\\DWM\\AccentColor."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\DWM") as key:
+            value, _kind = winreg.QueryValueEx(key, "AccentColor")
+    except OSError:
+        return None
+    red, green, blue = value & 0xFF, (value >> 8) & 0xFF, (value >> 16) & 0xFF
+    return f"#{red:02x}{green:02x}{blue:02x}"
+
+
+def _windows_signature() -> tuple | None:
+    """Kennzeichen der Windows-Farbeinstellungen (hell/dunkel, Akzent) – ändert es sich, ist das Design neu zu bauen."""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize") as key:
+            light = winreg.QueryValueEx(key, "AppsUseLightTheme")[0]
+    except OSError:
+        light = None
+    return light, _windows_accent()
 
 
 def _system(start: QPalette) -> Theme:
@@ -208,7 +264,6 @@ QWidget#operationBar {{ background: {c['surface']}; border: 1px solid {c['outlin
     )
 
 
-_start_palette: QPalette | None = None
 _current: Theme = _CLASSIC
 
 
@@ -234,14 +289,22 @@ def remembered() -> str:
     return name if name in NAMES else SYSTEM
 
 
+def system_palette(app) -> QPalette:
+    """Die Palette, die Qt gerade vom System bekommt (ohne die von WolfCAD gesetzten Farben).
+
+    Eine leere Palette setzen stellt die des Systems wieder her – so kommen auch Farben an, die sich erst nach dem
+    Programmstart geändert haben (vorher galt immer die Palette vom Start, das Design folgte nicht nach)."""
+    app.setPalette(QPalette())
+    return QPalette(app.palette())
+
+
 def apply(app, name: str | None = None, remember: bool = True) -> Theme:
     """Stellt das Design für die ganze Anwendung ein und merkt es sich auf Wunsch."""
-    global _start_palette, _current
-    if _start_palette is None:
-        _start_palette = QPalette(app.palette())        # so sah Qt beim Start aus (Grundlage für „Klassisch“)
+    global _current
+    base = system_palette(app)
     name = name if name in NAMES else remembered()
-    _current = _system(_start_palette) if name == SYSTEM else _CLASSIC
-    palette = QPalette(_start_palette)
+    _current = _system(base) if name == SYSTEM else _CLASSIC
+    palette = QPalette(base)
     for role, colour in (_current.palette or {}).items():
         palette.setColor(getattr(QPalette.ColorRole, role), QColor(colour))
     if _current.palette:
@@ -253,3 +316,38 @@ def apply(app, name: str | None = None, remember: bool = True) -> Theme:
     if remember:
         QSettings("WolfCAD", "WolfCAD").setValue("design", name)
     return _current
+
+
+class SystemWatcher(QObject):
+    """Meldet (gebündelt, mit kurzer Verzögerung), dass sich das Aussehen des Systems geändert hat.
+
+    Quellen: Wechsel hell/dunkel (QStyleHints.colorSchemeChanged), neue Systemfarben (Qt-Ereignis ThemeChange an
+    die Anwendung, z. B. andere Akzentfarbe unter Windows oder KDE) und unter Windows zur Sicherheit alle paar
+    Sekunden ein Blick in die Registrierung – nicht jede Windows-Fassung meldet einen Akzentwechsel an Qt."""
+
+    changed = Signal()
+    _POLL_MS = 3000
+
+    def __init__(self, app, parent: QObject | None = None):
+        super().__init__(parent)
+        self._delay = QTimer(self, singleShot=True, interval=300)       # viele Meldungen auf einmal → ein Neubau
+        self._delay.timeout.connect(self.changed)
+        app.styleHints().colorSchemeChanged.connect(lambda _scheme: self._delay.start())
+        app.installEventFilter(self)
+        self._signature = _windows_signature()
+        if self._signature is not None:
+            self._poll = QTimer(self, interval=self._POLL_MS)
+            self._poll.timeout.connect(self._check_windows)
+            self._poll.start()
+
+    def eventFilter(self, watched, event) -> bool:
+        # ThemeChange kommt vom System; das eigene setPalette löst nur ApplicationPaletteChange aus (keine Schleife)
+        if event.type() == QEvent.Type.ThemeChange:
+            self._delay.start()
+        return False
+
+    def _check_windows(self) -> None:
+        signature = _windows_signature()
+        if signature != self._signature:
+            self._signature = signature
+            self._delay.start()
