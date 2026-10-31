@@ -27,7 +27,7 @@ from ..core import sketch as sk
 from .icons import icon
 from .viewport import grid_patch
 from .sketch_editor import (_TOOL_ICONS, CENTER_RECT, LINE_CENTER, LINE_CONSTRUCTION, LINE_NORMAL, PICK_TOOLS,
-                            PROJECT_TOOL, TANGENT_ARC, THREE_POINT_ARC, THREE_POINT_CIRCLE, THREE_POINT_RECT,
+                            PROJECT_TOOL, INTERSECT_TOOL, TANGENT_ARC, THREE_POINT_ARC, THREE_POINT_CIRCLE, THREE_POINT_RECT,
                             THREE_TANGENT_CIRCLE, TOOLS, TWO_POINT_CIRCLE, TWO_TANGENT_CIRCLE, EntityTable,
                             SketchCanvas, has_profile)
 
@@ -102,10 +102,13 @@ class SketchSession:
     def __init__(self, viewport, feature: sk.Sketch, entities: list, reference: list | None = None,
                  constraints: list | None = None, axes=None, resolver=None,
                  construction: list | None = None, edge_picker=None, texts: list | None = None,
-                 centerlines: list | None = None, vertex_picker=None, projected: list | None = None):
+                 centerlines: list | None = None, vertex_picker=None, projected: list | None = None,
+                 section_picker=None):
         self.viewport = viewport
         # Liefert zu einem Fensterpunkt die getroffenen Körperkanten (für „Projizieren“)
         self._edge_picker = edge_picker
+        # Schnittkurve: liefert zu Fensterpunkt und Skizzenebene die Schnittkanten des getroffenen Körpers
+        self._section_picker = section_picker
         # 3D-Skizze: liefert zu einem Fensterpunkt die getroffene Körperecke im Raum (oder None)
         self._vertex_picker = vertex_picker
         self._z_last = 0.0          # Höhe (längs der Normale) des letzten Punkts im laufenden 3D-Linienzug
@@ -295,14 +298,64 @@ class SketchSession:
             return
         height, accepted = QInputDialog.getDouble(self.viewport, "Text", "Schrifthöhe (mm):",
                                                   self.canvas.text_height, 0.5, 1000.0, 1)
-        if accepted:
+        if not accepted:
+            return
+        # Text am Pfad (Runde 96, wie Fusion): auf eine Kurve geklickt, läuft der Text ab dieser Stelle an ihr entlang
+        path = self.canvas._entity_at(x, y)
+        if path is not None and self.canvas.entities[path][0] in ("Linie", "Bogen", "Kreis", sk.SPLINE,
+                                                                   sk.ELLIPSE, sk.CONIC, sk.CP_SPLINE):
+            self.canvas.add_text(text, self._distance_along(path, x, y), 0.0, height, path=path)
+        else:
             self.canvas.add_text(text, x, y, height)
-            self.redraw()
+        self.redraw()
+
+    def _axes(self):
+        from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+        return gp_Ax2(gp_Pnt(*self._origin), gp_Dir(*self.normal), gp_Dir(*self._x))
+
+    def _distance_along(self, index: int, x: float, y: float) -> float:
+        """Abstand vom Anfang des Elements `index` bis zur Stelle, die (x, y) am nächsten liegt (entlang der Kurve)."""
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.GCPnts import GCPnts_AbscissaPoint
+        from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
+        from OCP.BRep import BRep_Tool
+        edge = sk._edge(self._axes(), self.canvas.entities[index])
+        adaptor = BRepAdaptor_Curve(edge)
+        first, last = adaptor.FirstParameter(), adaptor.LastParameter()
+        curve = BRep_Tool.Curve_s(edge, first, last)        # (die Anbindung gibt nur die Kurve zurück)
+        projector = GeomAPI_ProjectPointOnCurve(sk._point(self._axes(), x, y), curve, first, last)
+        if projector.NbPoints() == 0:
+            return 0.0
+        return float(GCPnts_AbscissaPoint.Length_s(adaptor, first, projector.LowerDistanceParameter()))
+
+    def _path_text_points(self, entry: list) -> list:
+        """Umrisse eines Textes am Pfad als Punktpaare (aus den Kanten der Buchstaben)."""
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+        try:
+            letters = sk.text_on_path(self._axes(), entry, sk._edge(self._axes(), self.canvas.entities[entry[6]]))
+        except Exception:
+            return []           # unbrauchbar: die Meldung kommt beim Berechnen der Skizze
+        points, explorer = [], TopExp_Explorer(letters, TopAbs_EDGE)
+        while explorer.More():
+            curve = BRepAdaptor_Curve(TopoDS.Edge(explorer.Current()))
+            samples = [curve.Value(curve.FirstParameter() + (curve.LastParameter() - curve.FirstParameter()) * k / 6)
+                       for k in range(7)]
+            for a, b in zip(samples, samples[1:]):
+                points += [(a.X(), a.Y(), a.Z()), (b.X(), b.Y(), b.Z())]
+            explorer.Next()
+        return points
 
     def text_segments(self) -> np.ndarray:
         """Umrisse aller Texte der Skizze als Liniensegmente im Raum."""
         points = []
-        for text, x, y, height, rotation, *font in self.canvas.texts:
+        for entry in self.canvas.texts:
+            if len(entry) == 7 and 0 <= entry[6] < len(self.canvas.entities):
+                points += self._path_text_points(entry)      # Text am Pfad: Umrisse aus den echten Buchstaben
+                continue
+            text, x, y, height, rotation, *font = entry[:6]
             cosine, sine = math.cos(math.radians(rotation)), math.sin(math.radians(rotation))
             try:
                 outline = sk.text_outline(text, height, font[0] if font else "")
@@ -387,6 +440,9 @@ class SketchSession:
 
     def drag_end(self) -> None:
         self.canvas.drag_end()
+        # Während des Ziehens rechnet das Modell nicht mit (siehe SketchPanel._canvas_changed); jetzt einmal melden,
+        # damit die späteren Schritte (Extrusion, Rundung …) dem neuen Stand folgen
+        self.canvas.changed.emit()
         self.redraw()
 
     def double_click(self, x: float, y: float) -> None:
@@ -444,6 +500,15 @@ class SketchSession:
         self.canvas.selected_rule = None
         if self.canvas.tool == PROJECT_TOOL:
             edges = self._edge_picker(x, y) if self._edge_picker is not None else []
+            self.canvas.add_entities(self.projected(edges))
+            self.redraw()
+            return
+        if self.canvas.tool == INTERSECT_TOOL:
+            # Schnittkurve: wo die Skizzenebene den angeklickten Körper schneidet (liegt schon in der Ebene)
+            plane = (tuple(self._origin), tuple(self.normal), tuple(self._x))
+            edges = self._section_picker(x, y, plane) if self._section_picker is not None else []
+            if not edges:
+                self.canvas.message = "Die Skizzenebene schneidet diesen Körper nicht"
             self.canvas.add_entities(self.projected(edges))
             self.redraw()
             return
@@ -1540,6 +1605,11 @@ class SketchPanel(QWidget):
         """Die Zeichenlogik meldet auch Werkzeugwechsel; weitergemeldet werden nur echte Änderungen."""
         self._update_status()
         self._session.redraw()
+        if self._canvas.is_dragging():
+            # Beim Ziehen eines Punkts kommt bei jedem Mausschritt eine Meldung. Die Skizze zeichnet sich selbst;
+            # das ganze Modell danach neu zu rechnen (mit Probelauf riskanter Schritte) kostete je Schritt
+            # Zehntelsekunden bis Sekunden und staute sich auf ~10 s (Runde 90). Gemeldet wird beim Loslassen.
+            return
         if self._snapshot() != self._last:
             self._store()
 

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from ..core import extras as ex
 from ..core import features as ft
+from ..core import gears as gr
 from ..core import meshes as ms
 from ..core import more_tools as mt
 from ..core import physics
@@ -113,6 +114,48 @@ def _flat_sheet(w, name: str = "Blatt", z: float = 0.0) -> dict:
     _add(w, sk.Sketch(name=name, plane="XY", offset=z, entities=sk.rectangle(-20, -14, 20, 14)))
     _add(w, sf.Patch(sketch=name))
     return {"surface": list(w.timeline.state.surfaces)[-1]}
+
+
+def _sculpt_step(values: dict):
+    from ..core import sculpt
+    return sculpt.SculptStep(mesh=values["mesh"], data="")
+
+
+def _sculpt_strokes(rec, w, index: int) -> None:
+    """Formen für den Clip: echte Pinselstriche am Netz (wie im Formen-Modus), je Tupfer ein Bild."""
+    import numpy as np
+    from ..core import sculpt
+    feature = w.timeline.features[index]
+    mesh = sculpt.SculptMesh.from_triangles(w.timeline.state_before(index).meshes[feature.mesh])
+    for kind, start, end, radius, caption in (
+            ("Zeichnen", (-8, -15, -2), (8, -15, 4), 4.0, "Zeichnen: Material heraus"),
+            ("Aufblasen", (-4, -15, -8), (4, -15, -8), 4.0, "Aufblasen"),
+            ("Greifen", (0, -15, 7), (0, -19, 10), 7.0, "Greifen (G): Bereich ziehen"),
+            ("Glätten", (-8, -15, 0), (8, -15, 0), 6.0, "Glätten (Umschalt)")):
+        rec.caption = "2  " + caption
+        hit = mesh.ray_hit((start[0], -100, start[2]), (0, 1, 0))
+        if hit is None:
+            continue
+        stroke = sculpt.Stroke(mesh, sculpt.Brush(kind=kind, radius=radius, strength=0.7), hit[0], (0, 1, 0))
+        for step in range(1, 9):
+            t = step / 8
+            point = np.array(start) + (np.array(end) - np.array(start)) * t
+            if kind != "Greifen":
+                found = mesh.ray_hit((point[0], -100, point[2]), (0, 1, 0))
+                point = found[0] if found is not None else point
+            stroke.move_to(point)
+            _set(w, index, data=mesh.pack())
+            rec.cursor = tuple(point)
+            rec.shot(hold=1)
+        mesh.refresh_tree()
+    rec.shot(hold=6)
+
+
+def _fine_ball(w) -> dict:
+    """Fein zerlegte Netzkugel zum Formen (wie Blenders Kugel mit vielen Flächen)."""
+    _add(w, solids.Sphere(diameter=30, operation=NEW))
+    _add(w, ms.BodyToMesh(body=_first(w), deflection=0.08, angle=0.08))
+    return {"mesh": _mesh(w)}
 
 
 def _mesh_ball(w) -> dict:
@@ -372,6 +415,11 @@ MODEL_MORE = {
     "Spule": _scene(lambda w, v: ex.Coil(diameter=24.0, pitch=7.0, turns=0.5, section=3.0), field="turns",
                     start=0.5, end=4.0, look=((0, 0, 14), 130),
                     captions=("1  Werkzeug starten", "2  Windungen einstellen", "3  Eingabe – fertig")),
+    # Runde 97: Zahnrad – wächst am Pfeil in die Breite, danach bekommt es mehr Zähne
+    "Zahnrad": _scene(lambda w, v: gr.Gear(module=2.0, teeth=16, thickness=0.5, bore=6.0), field="thickness",
+                      start=0.5, end=10.0, look=((0, 0, 4), 300, -30.0, 40.0),
+                      captions=("1  Werkzeug starten", "2  Zahnbreite einstellen", "3  Eingabe – fertig"),
+                      after=lambda rec, w, i: [(_set(w, i, teeth=n), rec.shot(hold=3)) for n in (18, 20, 24)]),
     "Rohr": _scene(lambda w, v: ex.Pipe(path="Pfad", diameter=1.0), setup=_sweep_setup, field="diameter",
                    start=1.0, end=9.0, pick=lambda w, v: (0, 10, 0), look=((5, 15, 4), 130),
                    captions=("1  Pfad anklicken", "2  Durchmesser einstellen", "3  Eingabe – fertig")),
@@ -494,6 +542,11 @@ MODEL_MORE = {
                               pick=lambda w, v: (0, 0, 15), look=((0, 0, 0), 110),
                               captions=("1  Netz wählen", "2  Löcher und Fehler werden behoben",
                                         "3  Eingabe – fertig")),
+    # Runde 94: Formen wie in Blender – Kugel als Netz, Striche mit Zeichnen, Aufblasen, Greifen, Glätten
+    "Formen": _scene(lambda w, v: _sculpt_step(v), setup=_fine_ball, pick=lambda w, v: (0, -15, 0),
+                     look=((0, 0, 0), 150, -20.0, 15.0),
+                     captions=("1  Netz anklicken, „Formen“ starten", "2  Über die Oberfläche streichen",
+                               "3  Eingabe – fertig"), after=lambda rec, w, i: _sculpt_strokes(rec, w, i)),
     "Netz glätten": _scene(lambda w, v: ms.MeshSmooth(mesh=v["mesh"], iterations=1, strength=0.5),
                            setup=lambda w: (_add(w, solids.Box(length=30, width=30, height=20, operation=NEW)),
                                             _add(w, ms.BodyToMesh(body=_first(w), deflection=0.3)),
@@ -767,6 +820,9 @@ SKETCH_MORE = {
     "Projizieren": _drawing([("Körperkanten anklicken – sie kommen in die Skizze", 10, lambda t: (
                                  sk.rectangle(-15, -10, 15, 10), (15 - 30 * t, -10, 0), None,
                                  {"projected": [0, 1, 2, 3] if t >= 0.5 else []}))]),
+    "Schnittkurve": _drawing([("Körper anklicken – sein Schnitt kommt in die Skizze", 10, lambda t: (
+                                  [sk.circle(0, 0, 12)] if t >= 0.5 else [], (12 - 6 * t, 4, 0), None,
+                                  {"projected": [0] if t >= 0.5 else []}))]),
     "Muster": _drawing([("Elemente wählen, Anzahl und Abstand einstellen", 18, lambda t: (
                             [sk.circle(-18 + 12 * column, -8 + 12 * row, 3)
                              for column in range(1 + round(3 * t)) for row in range(1 + round(t))],

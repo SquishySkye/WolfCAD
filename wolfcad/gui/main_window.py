@@ -24,8 +24,8 @@ from PySide6.QtGui import QAction, QColor, QCursor, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDockWidget, QDoubleSpinBox, QFileDialog,
     QFormLayout, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
-    QProgressDialog, QPushButton, QScrollArea, QTabWidget, QToolBar, QToolButton, QToolTip, QTreeWidget, QVBoxLayout,
-    QTreeWidgetItem, QWidget,
+    QHeaderView, QProgressDialog, QPushButton, QScrollArea, QTabWidget, QToolBar, QToolButton, QToolTip, QTreeWidget, QVBoxLayout,
+    QTableWidget, QTableWidgetItem, QTreeWidgetItem, QWidget,
 )
 
 from ..core import constraints as cs
@@ -36,6 +36,8 @@ from ..core import surfaces as sf
 from ..core import meshes as ms
 from ..core import extras as ex
 from ..core import more_tools as mt
+from ..core import sculpt as sc
+from ..core import gears as gr
 from ..core import inserts
 from ..core import parameters as pm
 from ..core.timeline import GEOMETRY_LEVEL, ROBUST_KINDS, Timeline
@@ -46,6 +48,7 @@ from .icons import icon, logo_pixmap
 from .parameters_ui import ExpressionBox, ParameterDialog
 from .region_picker import RegionPicker, _inside as _inside_triangle
 from .ribbon import Ribbon
+from .sculpt_ui import SculptSession
 from .selection_field import SelectionField
 from .physics_ui import PHYSICS_TAB, PANELS as _PHYSICS_PANELS, PhysicsTools
 from . import tool_hints
@@ -75,6 +78,12 @@ _LABELS = {
     "regions": "Profil", "region_points": "Gewählte Bereiche", "frame": "Lage",
     "extra_profiles": "Weitere Skizzenprofile", "placement": "Lage des Profils",
     "extent": "Richtung", "distance2": "Zweiter Abstand (mm)", "taper": "Verjüngung (°)",
+    "taper2": "Verjüngung zweite Seite (°)", "distribution": "Verteilung",
+    "symmetric": "Symmetrisch (nach beiden Seiten)", "second_symmetric": "Zweite Richtung symmetrisch",
+    "skip": "Exemplare unterdrücken", "participants": "Beteiligte Körper", "centerline": "Mittellinie", "move_type": "Art", "from_point": "Startpunkt",
+    "to_point": "Zielpunkt", "more": "Weitere Profile", "closed": "Geschlossen",
+    "ruled": "Gerade Übergänge", "extrude_type": "Art", "wall": "Wandstärke (mm)",
+    "wall_side": "Lage der Wand",
     "chamfer_type": "Art", "radius2": "Radius am Ende (mm, 0 = gleich)", "tapped": "Gewinde", "points_sketch": "An Punkten der Skizze",
     "object_type": "Objekttyp", "source_feature": "Feature", "compute": "Berechnung",
     "rotate_axis": "Drehachse (durch die Flächenmitte)", "rotate_angle": "Drehwinkel (°)",
@@ -153,6 +162,29 @@ _KIND_LABELS = {
     ("Saum", "edge_points"): "Kanten", ("Saum", "length"): "Saumlänge (mm)", ("Saum", "gap"): "Spalt (mm)",
     ("Saum", "flip"): "Zur anderen Seite falten",
     ("Verrundung", "wall_aware"): "Gleich dicke Wand (außen Radius + Wandstärke)",
+    # Runde 95/96: weitere Fusion-Optionen
+    ("Schräge", "sides"): "Seiten", ("Schräge", "angle2"): "Winkel zweite Seite (°)",
+    ("Rippe", "thickness_side"): "Lage der Dicke", ("Rippe", "depth"): "Tiefe (mm, 0 = bis zum Körper)",
+    ("Bohrung", "drill_point"): "Bohrspitze", ("Bohrung", "drill_angle"): "Spitzenwinkel (°)",
+    ("Gewinde", "hand"): "Richtung", ("Spule", "coil_type"): "Art", ("Spule", "height"): "Höhe (mm)",
+    ("Spule", "section_type"): "Querschnitt", ("Spule", "section_place"): "Lage des Querschnitts",
+    ("Rohr", "section_type"): "Querschnitt", ("Sweep", "distance"): "Abstand (Anteil des Pfads, 0 … 1)",
+    ("Sweep", "twist"): "Verdrehung (°)", ("Sweep", "taper"): "Verjüngung (°)",
+    # Runde 97: Zahnrad
+    ("Zahnrad", "gear_type"): "Art", ("Zahnrad", "module"): "Modul (mm)", ("Zahnrad", "teeth"): "Zähnezahl",
+    ("Zahnrad", "pressure_angle"): "Eingriffswinkel (°)", ("Zahnrad", "thickness"): "Zahnbreite (mm)",
+    ("Zahnrad", "bore"): "Bohrung (mm, 0 = ohne)", ("Zahnrad", "backlash"): "Flankenspiel (mm)",
+    ("Zahnrad", "helix_angle"): "Schrägungswinkel (°)", ("Zahnrad", "rim"): "Wandstärke / Steghöhe (mm)",
+    # Runde 91: Fusion-Funktionen der Rundung und Fase
+    ("Verrundung", "fillet_type"): "Art", ("Verrundung", "radius_type"): "Radiusart",
+    ("Verrundung", "radius"): "Radius (mm; Sehnenlänge: Sehne)", ("Verrundung", "radius2"): "Radius am Ende (mm)",
+    ("Verrundung", "mid_radius"): "Radius am Zwischenpunkt (mm, 0 = keiner)",
+    ("Verrundung", "mid_position"): "Lage des Zwischenpunkts (0 … 1)",
+    ("Verrundung", "sets"): "Weitere Sätze (+ schließt den Satz ab)",
+    ("Verrundung", "rule_scope"): "Umfang", ("Verrundung", "rule_rounds"): "Rundungen (Außenkanten)",
+    ("Verrundung", "rule_fillets"): "Kehlen (Innenkanten)",
+    ("Verrundung", "face_points"): "Flächen (Regel) bzw. Mittelfläche (volle Rundung)",
+    ("Fase", "sets"): "Weitere Sätze (+ schließt den Satz ab)",
     ("Verschieben", "copy"): "Kopie erstellen", ("Kombinieren", "keep_tool"): "Werkzeugkörper behalten",
     ("Verschieben", "axis"): "Achse des Winkels", ("Verschieben", "angle"): "Drehen um diese Achse (°)",
     ("Verschieben", "angle_x"): "Drehen um X (°)", ("Verschieben", "angle_y"): "Drehen um Y (°)",
@@ -223,6 +255,7 @@ _RIBBON_PLACES = {
     "Netz einfügen": [(MESH_TAB, "ERSTELLEN", True)], "Körper in Netz umwandeln": [(MESH_TAB, "ERSTELLEN", True)],
     "Netz in Körper umwandeln": [(MESH_TAB, "ÄNDERN", True)], "Netz verkleinern": [(MESH_TAB, "ÄNDERN", True)],
     "Netz reparieren": [(MESH_TAB, "ÄNDERN", True)], "Netz glätten": [(MESH_TAB, "ÄNDERN", True)],
+    "Formen": [(MESH_TAB, "ÄNDERN", True)],
     "Netz als STL speichern": [(MESH_TAB, "AUSGABE", True)],
     "Extrusion": [(SOLID_TAB, "ERSTELLEN", True)], "Drehen": [(SOLID_TAB, "ERSTELLEN", True)],
     "Sweep": [(SOLID_TAB, "ERSTELLEN", False)], "Erhebung": [(SOLID_TAB, "ERSTELLEN", False)],
@@ -253,6 +286,7 @@ _RIBBON_PLACES = {
     "Einpassen": [(UTILITY_TAB, "ANSICHT", True)], "Raster": [(UTILITY_TAB, "ANSICHT", True)],
     "Abspielen": [(UTILITY_TAB, "FUSION", True)], "Hilfskörper": [(UTILITY_TAB, "FUSION", True)],
     "Torus": [(SOLID_TAB, "ERSTELLEN", False)], "Spule": [(SOLID_TAB, "ERSTELLEN", False)],
+    "Zahnrad": [(SOLID_TAB, "ERSTELLEN", False)],
     "Rohr": [(SOLID_TAB, "ERSTELLEN", False)],
     "Fläche teilen": [(SOLID_TAB, "ÄNDERN", False)], "Ausrichten": [(SOLID_TAB, "ÄNDERN", False)],
     "Physisches Material": [(SOLID_TAB, "ÄNDERN", False)], "Alle berechnen": [(SOLID_TAB, "ÄNDERN", False)],
@@ -280,7 +314,9 @@ _RIBBON_EXTRA = {"Import": (SOLID_TAB, "EINFÜGEN"), "Zeichnung": (UTILITY_TAB, 
 # auch nach dem Schließen des Programms in einen anderen Entwurf eingefügt werden können
 _BODY_CLIPBOARD_MIME = "application/x-wolfcad-koerper"
 _BODY_CLIPBOARD_FILE = Path.home() / ".local/share/wolfcad/zwischenablage.json"
-_TEXT_FIELDS = {"component": "leer = Name dieses Schritts"}     # Feldname -> Hinweis im leeren Feld
+_TEXT_FIELDS = {"component": "leer = Name dieses Schritts",     # Feldname -> Hinweis im leeren Feld
+                "skip": "z. B. 3, 5-7 (1 = Original)",
+                "participants": "leer = alle berührten, sonst z. B. Körper1, Körper3"}
 # Tastenkürzel nach dem Vorbild von Fusion: beim Skizzieren Werkzeuge der Skizze, sonst die des Modells
 _SKETCH_KEYS = {"L": "Linie", "R": "Rechteck", "C": "Kreis", "A": "Bogen", "D": "Bemaßung", "T": "Stutzen",
                 "O": "Versatz", "X": "Konstruktion", "P": "Projizieren", "S": "Spline", "F": "Abrunden"}
@@ -340,6 +376,97 @@ def cs_tools() -> list[str]:
             if tool not in se.EDIT_TOOLS and tool not in (cs.DISTANCE, cs.ANGLE)]
 
 
+# Bildsymbole der Varianten wie in Fusion (Runde 92): Art der Rundung, Radiusart, Art der Fase
+_CHOICE_ICONS = {
+    "fillet_type": dict(zip(ft.FILLET_KINDS, ("fillet_kind_fillet", "fillet_kind_rule", "fillet_kind_full"))),
+    "radius_type": dict(zip(ft.RADIUS_KINDS, ("radius_constant", "radius_chord", "radius_variable"))),
+    "chamfer_type": dict(zip(ft.CHAMFER_KINDS, ("chamfer_equal", "chamfer_two", "chamfer_angle"))),
+}
+
+
+class SetsTable(QWidget):
+    """Auswahlsätze einer Rundung/Fase als Tabelle wie in Fusion (Runde 92): je abgeschlossenem Satz eine Zeile mit
+    seiner Farbe (wie Pfeil und Kanten in der Ansicht), der Zahl seiner Kanten, seinem Maß zum Eintippen und ✕;
+    darunter „+ Neuer Satz“. Der gerade bearbeitete Satz steht in der letzten Zeile (blauer Pfeil, gelbe Kanten)."""
+
+    added = Signal()
+    edited = Signal(int, float)         # Nummer des Satzes, neues Maß
+    removed = Signal(int)
+
+    def __init__(self, resolver, parent=None):
+        super().__init__(parent)
+        self._resolver = resolver
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 4, 0, 4)
+        layout.setSpacing(4)
+        layout.addWidget(QLabel("Auswahlsätze (je Satz eigene Kanten und eigenes Maß):"))
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(["", "Satz", "Maß (mm)", ""])
+        self.table.verticalHeader().hide()
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        layout.addWidget(self.table)
+        add = QPushButton(icon("new"), "  Neuer Satz (+)")
+        add.setToolTip("Die gerade gewählten Kanten mit ihrem Maß als Satz abschließen; danach angeklickte Kanten "
+                       "bilden den nächsten Satz (eigener Pfeil)")
+        add.clicked.connect(self.added)
+        layout.addWidget(add)
+        self._active = (0, 0.0)
+
+    def show_sets(self, sets: list, active_count: int = 0, active_size: float = 0.0) -> None:
+        """Füllt die Tabelle neu: abgeschlossene Sätze, dann der gerade bearbeitete."""
+        from .handles import SET_COLORS
+        self.table.setRowCount(len(sets) + 1)
+        for number, entry in enumerate(sets):
+            colour = SET_COLORS[number % len(SET_COLORS)]
+            swatch = QTableWidgetItem("●")
+            swatch.setForeground(QColor.fromRgbF(*colour))
+            self.table.setItem(number, 0, swatch)
+            count = len(entry.get("edge_points", []))
+            self.table.setItem(number, 1, QTableWidgetItem(f"Satz {number + 1}: {count} "
+                                                           f"{'Kante' if count == 1 else 'Kanten'}"))
+            box = ExpressionBox(self._resolver, live=True)
+            box.setRange(0.0, 1e4)
+            box.setDecimals(2)
+            box.set_expression("", float(entry.get("radius", entry.get("distance", 0.0))))
+            box.edited.connect(lambda number=number, box=box: self.edited.emit(number, box.value()))
+            self.table.setCellWidget(number, 2, box)
+            remove = QToolButton()
+            remove.setText("✕")
+            remove.setToolTip("Diesen Satz entfernen")
+            remove.clicked.connect(lambda _checked=False, number=number: self.removed.emit(number))
+            self.table.setCellWidget(number, 3, remove)
+        row = len(sets)
+        active = QTableWidgetItem("●")
+        active.setForeground(QColor.fromRgbF(1.0, 0.85, 0.2))      # wie die gelb hervorgehobenen Kanten
+        self.table.setItem(row, 0, active)
+        self.table.setItem(row, 1, QTableWidgetItem(f"Satz {row + 1} (in Arbeit): {active_count} "
+                                                    f"{'Kante' if active_count == 1 else 'Kanten'}"))
+        self.table.setItem(row, 2, QTableWidgetItem(f"{active_size:g} – am Pfeil"))
+        self.table.removeCellWidget(row, 2)
+        self.table.removeCellWidget(row, 3)
+        self.table.setFixedHeight(self.table.horizontalHeader().height() + 4
+                                  + sum(self.table.rowHeight(r) for r in range(self.table.rowCount())))
+
+
+# Meldungen eines Schritts, die nur um eine Auswahl bitten (kein echter Fehler, siehe _awaiting_selection)
+_SELECTION_WORDS = ("wählen", "anklicken", "gewählt sein", "gewählt werden")
+
+
+def _asks_for_selection(message: str) -> bool:
+    """Bittet die Fehlermeldung nur darum, etwas auszuwählen („Bitte einen Körper wählen“ …)?"""
+    head = message.split(" – ")[0]
+    if "abgestürzt" in head or head.startswith("Geometriefehler"):
+        return False
+    return "anklicken" in head or ((head.startswith("Bitte ") or head.startswith("Vor dem Werkzeug")
+                                    or head.startswith("Für ")) and any(word in head for word in _SELECTION_WORDS))
+
+
 class FeatureForm(QWidget):
     """Eingabefelder für die Parameter eines Features; meldet jede Änderung sofort.
 
@@ -350,6 +477,9 @@ class FeatureForm(QWidget):
     changed = Signal()
     cleared = Signal(str)       # Name eines Auswahlfelds, dessen ✕ geklickt wurde
     field_activated = Signal(str)   # Name eines Auswahlfelds (Kombinieren), das angeklickt und damit aktiv wurde
+    new_set = Signal()          # „+“ an Rundung/Fase: den Satz abschließen und einen neuen beginnen (wie Fusion)
+    set_edited = Signal(int, float)     # Maß eines abgeschlossenen Satzes in der Tabelle geändert
+    set_removed = Signal(int)           # ✕ an einem Satz
 
     def __init__(self, feature: ft.Feature, sketch_names: list[str], parent=None,
                  body_names: list[str] | None = None, resolver=None,
@@ -378,6 +508,7 @@ class FeatureForm(QWidget):
                    "sketch3": [solids.NO_SKETCH, *sketch_names],
                    "points_sketch": [solids.NO_SKETCH, *sketch_names],
                    "guide": [solids.NO_SKETCH, *sketch_names], "guide_mode": list(solids.GUIDE_MODES),
+                   "centerline": [solids.NO_SKETCH, *sketch_names],
                    # Muster von Features: frühere Schritte, die Körper verändert haben
                    "object_type": list(solids.PATTERN_OBJECTS), "source_feature": list(feature_names or []),
                    "compute": list(solids.PATTERN_COMPUTE), "rotate_axis": list(solids.AXES),
@@ -394,6 +525,15 @@ class FeatureForm(QWidget):
                    "regions": list(ft.PROFILE_MODES), "placement": list(solids.SWEEP_PLACEMENTS),
                    "extent": list(ft.EXTENTS),
                    "chamfer_type": list(ft.CHAMFER_KINDS), "tapped": list(solids.TAP_OPTIONS),
+                   "fillet_type": list(ft.FILLET_KINDS), "radius_type": list(ft.RADIUS_KINDS),
+                   "extrude_type": list(ft.EXTRUDE_TYPES), "wall_side": list(ft.WALL_SIDES),
+                   "distribution": list(solids.PATTERN_DISTRIBUTIONS), "move_type": list(solids.MOVE_TYPES),
+                   # Runde 96
+                   "sides": list(solids.DRAFT_SIDES), "thickness_side": list(solids.RIB_SIDES),
+                   "drill_point": list(solids.DRILL_POINTS), "hand": list(solids.THREAD_HANDS),
+                   "coil_type": list(ex.COIL_TYPES), "section_type": list(ex.SECTIONS),
+                   "section_place": list(ex.SECTION_PLACES), "gear_type": list(gr.GEAR_TYPES),
+                   "rule_scope": list(ft.RULE_SCOPES),
                    "orientation": list(solids.PATH_ORIENTATIONS),
                    "opening": list(solids.OPENINGS), "keep": list(solids.SPLIT_KEEP),
                    "reference": list(solids.SCALE_REFERENCES), "neutral": list(solids.DRAFT_NEUTRAL)}
@@ -414,6 +554,8 @@ class FeatureForm(QWidget):
             choices["extent"] = list(solids.REVOLVE_EXTENTS)     # Drehen: eine Seite, symmetrisch, zwei Seiten
         if isinstance(feature, solids.Shell):
             choices["direction"] = list(solids.SHELL_DIRECTIONS)  # Schale: innen, außen, beidseitig
+        if isinstance(feature, ex.Pipe):
+            choices["section_type"] = list(ex.PIPE_SECTIONS)     # Rohr: Kreis, Quadrat, Dreieck
         if isinstance(feature, solids.SplitBody):
             choices["tool"] = [*bodies, *(surface_names or [])]  # Trennwerkzeug: Körper oder Flächenkörper
             choices["tool_body"] = ["", *bodies, *(surface_names or [])]   # Herkunft der angeklickten Trennflächen
@@ -447,6 +589,14 @@ class FeatureForm(QWidget):
             if item.name in choices:
                 editor = QComboBox()
                 editor.addItems(choices[item.name])
+                pictures = _CHOICE_ICONS.get(item.name, {})
+                if pictures:
+                    # Varianten mit Bild wie in Fusion (Art der Rundung, Radiusart, Art der Fase)
+                    from PySide6.QtCore import QSize
+                    editor.setIconSize(QSize(28, 28))
+                    for number in range(editor.count()):
+                        if editor.itemText(number) in pictures:
+                            editor.setItemIcon(number, icon(pictures[editor.itemText(number)]))
                 # Ein gespeicherter Wert bleibt wählbar, auch wenn es ihn gerade nicht gibt
                 if value and editor.findText(value) < 0:
                     editor.addItem(value)
@@ -468,6 +618,18 @@ class FeatureForm(QWidget):
                 editor = ExpressionBox(resolver, live=True)      # Modell läuft beim Tippen mit
                 editor.set_expression(feature.expressions.get(item.name, ""), value)
                 editor.edited.connect(self.changed)
+            elif isinstance(value, list) and item.name == "sets":
+                # Auswahlsätze (Runde 91/92): Tabelle über die ganze Breite des Formulars, wie in Fusion
+                table = SetsTable(resolver)
+                size = getattr(feature, "radius", getattr(feature, "distance", 0.0))
+                table.show_sets(value, len(getattr(feature, "edge_points", [])), size)
+                table.added.connect(self.new_set)
+                table.edited.connect(self.set_edited)
+                table.removed.connect(self.set_removed)
+                self._editors[item.name] = table
+                self._row_widgets[item.name] = table
+                form.addRow(table)
+                continue
             elif isinstance(value, list):
                 # Auswahl aus der 3D-Ansicht: wird nur angezeigt
                 if item.name == "frame":
@@ -512,7 +674,11 @@ class FeatureForm(QWidget):
         # Nur die Felder zeigen, die zur gewählten Variante gehören (wie in Fusion): Richtung der Extrusion,
         # Art der Fase
         for chooser, table in (("extent", ft.EXTENT_FIELDS), ("chamfer_type", ft.CHAMFER_FIELDS),
-                               ("object_type", solids.PATTERN_OBJECT_FIELDS)):
+                               ("object_type", solids.PATTERN_OBJECT_FIELDS), ("fillet_type", ft.FILLET_FIELDS),
+                               ("radius_type", ft.RADIUS_FIELDS), ("extrude_type", ft.EXTRUDE_TYPE_FIELDS),
+                               ("sides", {"angle2": (solids.DRAFT_SIDES[2],)}), ("coil_type", ex.COIL_FIELDS),
+                               ("gear_type", gr.GEAR_FIELDS),
+                               ("drill_point", {"drill_angle": (solids.DRILL_POINTS[1],)})):
             editor = self._editors.get(chooser)
             if isinstance(editor, QComboBox):
                 editor.currentTextChanged.connect(lambda text, rows=table: self._show_variant_fields(rows, text))
@@ -541,6 +707,15 @@ class FeatureForm(QWidget):
     def set_list(self, name: str, value: list) -> None:
         """Zeigt eine in der Ansicht getroffene Auswahl (z. B. die Zielfläche) im Nur-Lese-Feld an."""
         editor = self._editors.get(name)
+        if isinstance(editor, SetsTable):
+            feature = self._feature
+            editor.show_sets(value, len(getattr(feature, "edge_points", [])),
+                             getattr(feature, "radius", getattr(feature, "distance", 0.0)))
+            return
+        if name == "edge_points" and isinstance(self._editors.get("sets"), SetsTable):
+            # die Zeile des gerade bearbeiteten Satzes zählt seine Kanten mit
+            self._editors["sets"].show_sets(self._feature.sets, len(value),
+                                            getattr(self._feature, "radius", getattr(self._feature, "distance", 0.0)))
         if isinstance(editor, QLineEdit):
             if value and all(isinstance(item, str) for item in value):
                 editor.setText(", ".join(value))        # Körpernamen (z. B. Werkzeugkörper) lesbar zeigen
@@ -549,6 +724,10 @@ class FeatureForm(QWidget):
 
     def set_value(self, name: str, value: float) -> None:
         """Trägt einen Zahlenwert ein, ohne eine Änderung zu melden (z. B. beim Ziehen des Pfeils)."""
+        table = self._editors.get("sets")
+        if isinstance(table, SetsTable) and name in ("radius", "distance"):
+            # das Maß des gerade bearbeiteten Satzes steht auch in der letzten Tabellenzeile
+            table.show_sets(self._feature.sets, len(self._feature.edge_points), value)
         editor = self._editors.get(name)
         if isinstance(editor, ExpressionBox) and not editor.hasFocus():
             # (tippt man gerade in diesem Feld, bleibt der getippte Text stehen)
@@ -917,6 +1096,10 @@ class MainWindow(QMainWindow):
         self._recovery_timer.timeout.connect(self.write_recovery)
         self._profile_pick: dict | None = None      # Profilwahl für die Extrusion: Bereiche und gewählte Nummern
         self._pending_presspull = False             # Drücken/Ziehen wartet auf den Klick auf Fläche oder Profil
+        # Werkzeug, das wie in Fusion auf Klicks im Modell wartet (Runde 93): {"title", "attempt"}; `attempt()` legt
+        # den Schritt an, sobald die Auswahl reicht, und meldet dann True
+        self._pending_pick: dict | None = None
+        self._sculpt: SculptSession | None = None   # laufender Formen-Modus (Runde 94)
         self._selected_profiles: list[dict] = []    # im Modell angeklickte Profile (vor „Extrusion“)
         self._operation_bar: QWidget | None = None  # Knöpfe „Verbinden/Ausschneiden/…“ in der Ansicht
         self._operation_buttons: dict[str, QPushButton] = {}
@@ -1114,6 +1297,10 @@ class MainWindow(QMainWindow):
                "Ring: Ring- und Querschnittsdurchmesser einstellen")
         action("Spule", "coil", lambda: self._create(ex.Coil(operation=self._default_operation())),
                "Schraubenfeder: Windungsdurchmesser, Steigung, Windungen und Drahtdurchmesser")
+        # Runde 97: Zahnrad mit Evolventenverzahnung (Stirnrad, schräg, Pfeil, Hohlrad, Zahnstange)
+        action("Zahnrad", "gear", lambda: self._create(gr.Gear(operation=self._default_operation())),
+               "Zahnrad: Modul, Zähnezahl und Eingriffswinkel – Stirnrad, schräg- oder pfeilverzahnt, Hohlrad, "
+               "Zahnstange")
         action("Rohr", "pipe", self._create_pipe,
                "Rohr entlang der letzten Skizze (Pfad): voll oder mit Wandstärke")
         action("Prägen", "emboss", lambda: self._create_from_sketch(mt.Emboss),
@@ -1210,6 +1397,9 @@ class MainWindow(QMainWindow):
                "Weniger Dreiecke: Ecken auf ein Raster zusammenlegen (Netz anklicken)")
         action("Netz reparieren", "mesh_repair", lambda: self._create(ms.MeshRepair()),
                "Doppelte und entartete Dreiecke entfernen, Ausrichtung vereinheitlichen, Löcher schließen")
+        action("Formen", "sculpt", self._start_sculpt,
+               "Formen (Sculpting) wie in Blender: Netz mit Pinseln modellieren – Zeichnen, Ton, Greifen, Glätten, "
+               "Maske, Symmetrie (ein Volumenkörper wird dafür in ein Netz umgewandelt)")
         action("Netz glätten", "mesh_smooth", lambda: self._create(ms.MeshSmooth()),
                "Netz glätten (Rauschen und Treppen eines Scans), ohne dass es schrumpft")
         action("Netz schneiden", "mesh_plane_cut", lambda: self._create(ex.MeshPlaneCut()),
@@ -2043,18 +2233,50 @@ class MainWindow(QMainWindow):
             return
         if self._live_pick(hit):
             return
+        if self._pending_pick is not None:
+            # Werkzeug wartet auf seine Auswahl: wie ein gewöhnlicher Klick dazunehmen bzw. herausnehmen (Strg nicht
+            # nötig), Skizzenprofile ebenso; reicht die Auswahl, entsteht der Schritt
+            if hit is not None:
+                self._selection = ([chosen for chosen in self._selection if chosen != hit] if hit in self._selection
+                                   else [*self._selection, hit])
+                self._show_selection()
+            else:
+                self._select_profile(x, y, True, blocked=False)
+            pending = self._pending_pick
+            self._pending_pick = None           # während des Versuchs nicht erneut warten
+            self._pick_done = False
+            self._start_tool(lambda: setattr(self, "_pick_done", bool(pending["attempt"]())))
+            if self._pick_done:
+                self.viewport.show_info("")
+            else:
+                self._pending_pick = pending
+            return
         if self._pending_presspull:
-            # Drücken/Ziehen wartet auf seine Fläche bzw. sein Profil
-            if hit is not None and hit[0] == "face":
+            # Drücken/Ziehen wartet auf seine Fläche bzw. sein Profil. Wie in Fusion (Runde 91): eine Kante startet
+            # eine Rundung an ihr, eine Rundungsfläche öffnet die Rundung, die sie gebildet hat (Radius ändern)
+            fillet_step = self._fillet_step_of(hit)
+            if fillet_step is not None:
+                self._pending_presspull = False
+                self.viewport.show_info("")
+                self._edit(fillet_step)
+            elif hit is not None and hit[0] == "edge":
                 self._pending_presspull = False
                 self.viewport.show_info("")
                 self._selection = [hit]
                 self._show_selection()
-                self._create(solids.PressPull())
+                self._start_tool(lambda: self._create(ft.Fillet(require_pick=True, wall_aware=True)))
+            elif hit is not None and hit[0] == "face":
+                self._pending_presspull = False
+                self.viewport.show_info("")
+                self._selection = [hit]
+                self._show_selection()
+                # erst jetzt entsteht der Schritt: wie beim direkten Start bei 0 (Runde 91 – bis dahin stand er hier
+                # auf 5 mm, schon der Klick auf die Fläche zog sie heraus)
+                self._start_tool(lambda: self._create(solids.PressPull()))
             elif self._select_profile(x, y, False, blocked=hit is not None):
                 self._pending_presspull = False
                 self.viewport.show_info("")
-                self._create_extrude()
+                self._start_tool(self._create_extrude)
             return
         if "sketch" in self._select_filter and self._select_profile(x, y, additive, blocked=hit is not None):
             return
@@ -2088,6 +2310,28 @@ class MainWindow(QMainWindow):
             return [edges[index]] if index < len(edges) else []
         faces = ft.faces_of(shape)
         return ft.unique_edges(faces[index]) if index < len(faces) else []
+
+    def _section_at(self, x: float, y: float, plane) -> list:
+        """Schnittkurve (Runde 96): die Kanten, an denen die Skizzenebene `plane` (Ursprung, Normale, x-Richtung)
+        den Körper unter dem Fensterpunkt schneidet."""
+        from OCP.BRepAlgoAPI import BRepAlgoAPI_Section
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+        from OCP.gp import gp_Dir, gp_Pln, gp_Pnt
+        hit = self._hit_at(x, y)
+        if hit is None or hit[1] not in self.timeline.state.bodies:
+            return []
+        origin, normal, _x_dir = plane
+        section = BRepAlgoAPI_Section(self.timeline.state.bodies[hit[1]], gp_Pln(gp_Pnt(*origin), gp_Dir(*normal)),
+                                      False)
+        section.Approximation(True)
+        section.Build()
+        edges, explorer = [], TopExp_Explorer(section.Shape(), TopAbs_EDGE)
+        while explorer.More():
+            edges.append(TopoDS.Edge(explorer.Current()))
+            explorer.Next()
+        return edges
 
     def _face_at(self, x: float, y: float) -> tuple[str, int] | None:
         """Die vorderste Körperfläche unter dem Fensterpunkt als (Körper, Nummer) – ohne den Vorrang von Kanten und
@@ -2257,6 +2501,57 @@ class MainWindow(QMainWindow):
             of_sketch(name, points)
         return chosen
 
+    def _fillet_step_of(self, hit) -> int | None:
+        """Nummer des Rundungsschritts, der die angeklickte Fläche gebildet hat (für Drücken/Ziehen wie in Fusion);
+        None, wenn die Fläche keine Rundungsfläche ist oder der Schritt nicht mehr bearbeitet werden kann."""
+        if hit is None or hit[0] != "face" or hit[1] not in self.timeline.state.bodies:
+            return None
+        faces = ft.faces_of(self.timeline.state.bodies[hit[1]])
+        if hit[2] >= len(faces) or sketch.face_frame(faces[hit[2]]) is not None:
+            return None                         # ebene Flächen zieht Drücken/Ziehen selbst
+        marker = [list(ft.face_point(faces[hit[2]]))]
+        # vom neuesten Schritt rückwärts: die Fläche ist neu im Körper nach der Rundung, aber nicht davor
+        for index in range(self.timeline.marker - 1, -1, -1):
+            feature = self.timeline.features[index]
+            entry = self.timeline.state.history.get(feature.name)
+            if not isinstance(feature, ft.Fillet) or feature.suppressed or entry is None:
+                continue
+            before, after, _feature = entry
+            if hit[1] not in after:
+                continue
+            try:
+                ft.find_by_points(ft.faces_of(after[hit[1]]), ft.face_point, marker, "Fläche")
+            except ft.FeatureError:
+                continue                        # gehört nicht zu dieser Rundung
+            if hit[1] in before:
+                try:
+                    ft.find_by_points(ft.faces_of(before[hit[1]]), ft.face_point, marker, "Fläche")
+                    continue                    # gab es schon vorher: nicht von dieser Rundung
+                except ft.FeatureError:
+                    pass
+            return index
+        return None
+
+    def _hit_face_in(self, hit, state):
+        """Die angeklickte Körperfläche, wiedergefunden im Stand `state` (meist der Stand vor dem laufenden Schritt).
+
+        Die Flächennummer eines Treffers gilt für den angezeigten Körper. Hat der laufende Schritt ihn schon verändert
+        (Extrusion mit „Verbinden“), zählen seine Flächen anders als vorher – bis Runde 90 wurde die Nummer direkt im
+        alten Körper nachgeschlagen: falsche Fläche oder IndexError (Nutzerprotokoll 2026-10-29). Gesucht wird
+        deshalb über den Merkpunkt der Fläche. None, wenn es sie vorher nicht gab oder kein Flächentreffer vorliegt.
+        """
+        if hit is None or hit[0] != "face" or hit[1] not in state.bodies:
+            return None
+        shown = self.timeline.state.bodies.get(hit[1])
+        faces = ft.faces_of(shown) if shown is not None else []
+        if hit[2] >= len(faces):
+            return None
+        try:
+            return ft.find_by_points(ft.faces_of(state.bodies[hit[1]]), ft.face_point,
+                                     [list(ft.face_point(faces[hit[2]]))], "Fläche")[0]
+        except ft.FeatureError:
+            return None
+
     def _live_extrude_click(self, x: float, y: float, hit) -> bool:
         """Wie in Fusion: solange die Extrusion offen ist, nimmt jeder Klick ein weiteres Skizzenprofil oder eine
         weitere ebene Körperfläche dazu – ein Klick auf schon Gewähltes nimmt es wieder heraus (ohne Strg).
@@ -2300,7 +2595,9 @@ class MainWindow(QMainWindow):
         else:
             if body_hit[0] != "face":
                 return False
-            face = ft.faces_of(before.bodies[body_hit[1]])[body_hit[2]]
+            face = self._hit_face_in(body_hit, before)
+            if face is None:
+                return False                    # die Fläche bildet erst diese Extrusion selbst
             target = self._extrude_target(feature, before, face)
             if target is not None:
                 # wie Fusion: eine Fläche vor/hinter dem Profil bestimmt, bis wohin aufgezogen wird
@@ -2345,6 +2642,8 @@ class MainWindow(QMainWindow):
         """Kantenwahl wie in Fusion für Abrunden, Fase, Flansch, Saum und Aufreißen: die Kante am Mauszeiger – auch
         eine verdeckte (durch den Körper hindurch), wenn keine sichtbare davorliegt. Bei Abrunden und Fase nimmt ein
         Klick auf eine Fläche alle ihre Kanten (erneut klicken nimmt sie wieder heraus)."""
+        if isinstance(feature, ft.Fillet) and feature.fillet_type != ft.FILLET_KINDS[0]:
+            return self._live_fillet_face_pick(index, feature, before, ray)
         origin, direction = np.array(ray[0]), np.array(ray[1])
         tolerance = _EDGE_PICK_PIXELS * getattr(self, "_last_pixel_angle", 0.002)
         best = None                     # (Entfernung längs des Strahls, Körper, Kante)
@@ -2372,6 +2671,8 @@ class MainWindow(QMainWindow):
             return False
         _distance, body, edges = best
         markers = [list(ft.edge_point(edge)) for edge in edges]
+        if self._toggle_in_finished_set(index, feature, body, markers):
+            return True
         current = list(feature.edge_points) if feature.body == body else []
         known = lambda marker: any(math.dist(marker, other) <= ft.SELECTION_TOLERANCE for other in current)
         if all(known(marker) for marker in markers):
@@ -2392,6 +2693,83 @@ class MainWindow(QMainWindow):
         self._refresh()
         return True
 
+    def _move_point_pick(self, index: int, feature, hit, point) -> bool:
+        """Verschieben „Punkt zu Punkt“ (Runde 95, wie Fusion): erster Klick der Startpunkt, zweiter der Zielpunkt;
+        ein weiterer Klick beginnt von vorn. Gefangen werden Eckpunkte und Kreismitten, sonst die Stelle am Körper."""
+        kind, body, number = hit
+        if kind == "vertex" and body in self.timeline.state.bodies:
+            spot = [float(c) for c in self._vertex_points(body)[number]]
+        elif point is not None:
+            spot = [float(c) for c in point]
+        else:
+            return False
+        form = self._live["form"]
+        if not feature.from_point or feature.to_point:
+            changes = {"from_point": spot, "to_point": []}
+            if feature.body == ft.ALL_BODIES and body in self.timeline.state.bodies:
+                changes["body"] = body          # der Körper des Startpunkts wird verschoben
+            self.statusBar().showMessage("Startpunkt gewählt – jetzt den Zielpunkt anklicken", 5000)
+        else:
+            changes = {"to_point": spot}
+        for name, value in changes.items():
+            editor = form._editors.get(name)
+            if isinstance(editor, QComboBox):
+                editor.blockSignals(True)
+                if editor.findText(value) < 0:
+                    editor.addItem(value)
+                editor.setCurrentText(value)
+                editor.blockSignals(False)
+            elif isinstance(value, list):
+                form.set_list(name, value)
+        self.timeline.update(index, **changes)
+        self._refresh()
+        return True
+
+    def _toggle_in_finished_set(self, index: int, feature, body: str, markers: list) -> bool:
+        """Liegen die angeklickten Kanten alle in einem abgeschlossenen Satz (Rundung/Fase, Runde 91), nimmt der
+        Klick sie dort heraus – wie in Fusion, wo jeder Satz seine Kanten behält. Leere Sätze fallen weg."""
+        sets = getattr(feature, "sets", [])
+        if not sets or feature.body != body:
+            return False
+        near = lambda marker, points: any(math.dist(marker, other) <= ft.SELECTION_TOLERANCE for other in points)
+        owner = next((number for number, entry in enumerate(sets)
+                      if all(near(marker, entry["edge_points"]) for marker in markers)), None)
+        if owner is None:
+            return False
+        changed = [dict(entry) for entry in sets]
+        changed[owner]["edge_points"] = [point for point in changed[owner]["edge_points"]
+                                         if not near(point, markers)]
+        changed = [entry for entry in changed if entry["edge_points"]]
+        self._live["form"].set_list("sets", changed)
+        self.timeline.update(index, sets=changed)
+        self._refresh()
+        return True
+
+    def _live_fillet_face_pick(self, index: int, feature, before: ft.BuildState, ray) -> bool:
+        """Regelverrundung „Kanten der gewählten Flächen“ und volle Rundung: die angeklickte Fläche dazunehmen bzw.
+        wieder herausnehmen (bei der vollen Rundung die Mittelfläche zwischen den Seiten)."""
+        faces = [(math.dist(ray[0], at), name, face) for name, shape in before.bodies.items()
+                 if name not in self._hidden_bodies
+                 for face, at in [ft.face_on_ray(shape, *ray) or (None, None)] if face is not None]
+        if not faces:
+            return False
+        _distance, body, face = min(faces, key=lambda item: item[0])
+        marker = list(ft.face_point(face))
+        current = list(feature.face_points) if feature.body == body else []
+        kept = [point for point in current if math.dist(point, marker) > ft.SELECTION_TOLERANCE]
+        chosen = kept if len(kept) < len(current) else [*current, marker]
+        editor = self._live["form"]._editors.get("body")
+        if isinstance(editor, QComboBox):
+            editor.blockSignals(True)
+            if editor.findText(body) < 0:
+                editor.addItem(body)
+            editor.setCurrentText(body)
+            editor.blockSignals(False)
+        self._live["form"].set_list("face_points", chosen)
+        self.timeline.update(index, body=body, face_points=chosen)
+        self._refresh()
+        return True
+
     def _pick_target_face(self, hit) -> bool:
         """Extrusion „Bis Fläche“ in Bearbeitung: ein Klick auf eine Körperfläche macht sie zur Zielfläche."""
         if self._live is None or self._live.get("session") is not None or hit is None or hit[0] != "face":
@@ -2399,13 +2777,10 @@ class MainWindow(QMainWindow):
         feature = self.timeline.features[self._live["index"]]
         if not isinstance(feature, ft.Extrude) or feature.extent != ft.EXTENTS[3]:
             return False
-        state = self.timeline.state_before(self._live["index"])
-        if hit[1] not in state.bodies:
+        face = self._hit_face_in(hit, self.timeline.state_before(self._live["index"]))
+        if face is None:
             return False
-        faces = ft.faces_of(state.bodies[hit[1]])
-        if hit[2] >= len(faces):
-            return False
-        points = [list(ft.face_point(faces[hit[2]]))]
+        points = [list(ft.face_point(face))]
         self.timeline.update(self._live["index"], target_points=points)
         self._live["form"].set_list("target_points", points)
         self._refresh()
@@ -2430,6 +2805,8 @@ class MainWindow(QMainWindow):
             return self._live_edge_pick(index, feature, before, ray)
         if isinstance(feature, solids.CombineBodies):
             return self._combine_pick(index, feature, before, ray)
+        if isinstance(feature, solids.MoveBody) and feature.move_type == solids.MOVE_TYPES[1] and hit is not None:
+            return self._move_point_pick(index, feature, hit, point)
         if isinstance(feature, solids.SplitBody) and ray is not None:
             return self._split_pick(index, feature, before, ray)
         if isinstance(feature, mt.Canvas) and ray is not None:
@@ -2537,6 +2914,8 @@ class MainWindow(QMainWindow):
                 form.set_list("remove_points", changes["remove_points"])
             elif isinstance(feature, sf.TrimSurface) and feature.surface and body != feature.surface:
                 changes = {"tool": body}
+            elif isinstance(feature, (sf.TrimSurface, sf.ExtendSurface)) and body not in before.surfaces:
+                return False        # zu stutzen bzw. verlängern ist ein Flächenkörper, kein Volumenkörper
             else:
                 changes = {"surface": body}
             for name, value in changes.items():
@@ -2638,6 +3017,20 @@ class MainWindow(QMainWindow):
             # (jeder weitere Klick fügt eine Fläche hinzu bzw. nimmt sie wieder heraus)
             single = isinstance(feature, (solids.ReplaceFace, mt.Emboss))
             changes = {"body": body, "face_points": [marker] if single else toggled(current, marker)}
+            if isinstance(feature, ex.SplitFace) and not current and sketch.face_frame(face) is not None:
+                # erste Fläche (Runde 93): Teilungsebene quer durch ihre Mitte – die Hauptebene, deren Normale am
+                # wenigsten zur Flächennormale passt; so teilt sie gleich sichtbar, der Pfeil verschiebt sie
+                normal = sketch.face_frame(face)[3:6]
+                plane = min(ft.MAIN_PLANES, key=lambda name: abs(sum(a * b for a, b in
+                                                                     zip(ft.PLANES[name][0], normal))))
+                along = ft.PLANES[plane][0]
+                changes.update(plane=plane, offset=float(sum(p * n for p, n in zip(marker[:3], along))))
+                editor = form._editors.get("plane")
+                if isinstance(editor, QComboBox):
+                    editor.blockSignals(True)
+                    editor.setCurrentText(plane)
+                    editor.blockSignals(False)
+                form.set_value("offset", changes["offset"])
         elif isinstance(feature, ft.Extrude) and feature.face_points:
             face = ft.nearest_face(shape, point)
             if face is None or sketch.face_frame(face) is None:
@@ -2702,6 +3095,48 @@ class MainWindow(QMainWindow):
         self.timeline.update(index, **changes)
         self._refresh()
         return True
+
+    def _new_selection_set(self) -> None:
+        """„+“ an Rundung/Fase (wie Fusion): die gewählten Kanten mit ihrem Maß werden ein eigener Satz; danach
+        angeklickte Kanten bilden den nächsten, der sein Maß am Pfeil bekommt."""
+        if self._live is None:
+            return
+        index = self._live["index"]
+        feature = self.timeline.features[index]
+        if not isinstance(feature, (ft.Fillet, ft.Chamfer)):
+            return
+        if not feature.edge_points:
+            self.statusBar().showMessage("Erst Kanten für diesen Satz anklicken, dann mit + abschließen", 5000)
+            return
+        size = "radius" if isinstance(feature, ft.Fillet) else "distance"
+        sets = [*feature.sets, {size: float(getattr(feature, size)), "edge_points": list(feature.edge_points)}]
+        self.timeline.update(index, sets=sets, edge_points=[])
+        form = self._live["form"]
+        form.set_list("sets", sets)
+        form.set_list("edge_points", [])
+        self.statusBar().showMessage(f"Satz {len(sets)} abgeschlossen – jetzt die Kanten des nächsten anklicken", 5000)
+        self._refresh()
+
+    def _edit_selection_set(self, number: int, value: float) -> None:
+        """Maß eines abgeschlossenen Satzes in der Tabelle eingetippt."""
+        feature = self.timeline.features[self._live["index"]] if self._live is not None else None
+        if not isinstance(feature, (ft.Fillet, ft.Chamfer)) or number >= len(feature.sets):
+            return
+        size = "radius" if isinstance(feature, ft.Fillet) else "distance"
+        sets = [dict(entry) for entry in feature.sets]
+        sets[number][size] = float(value)
+        self.timeline.update(self._live["index"], sets=sets)
+        self._refresh()
+
+    def _remove_selection_set(self, number: int) -> None:
+        """✕ an einem Satz: er fällt weg, seine Kanten bleiben ungerundet."""
+        feature = self.timeline.features[self._live["index"]] if self._live is not None else None
+        if not isinstance(feature, (ft.Fillet, ft.Chamfer)) or number >= len(feature.sets):
+            return
+        sets = [dict(entry) for index, entry in enumerate(feature.sets) if index != number]
+        self.timeline.update(self._live["index"], sets=sets)
+        self._live["form"].set_list("sets", sets)
+        self._refresh()
 
     def _live_cleared(self, name: str) -> None:
         """✕ an einem Auswahlfeld: das offene Werkzeug verliert seine gewählten Kanten bzw. Flächen."""
@@ -2772,6 +3207,8 @@ class MainWindow(QMainWindow):
         self.viewport.set_geometry("selected_faces", _stack(faces + live_faces))
         self._show_ghosts()
         self.viewport.set_geometry("selected_edges", _stack(edges + live_edges))
+        for number, segments in enumerate(self._set_edge_geometry()):
+            self.viewport.set_geometry(f"set_edges{number}", _stack(segments))
         if self._selection:
             count_edges = sum(1 for kind, _body, _index in self._selection if kind == "edge")
             count_points = sum(1 for kind, _body, _index in self._selection if kind == "vertex")
@@ -2842,6 +3279,31 @@ class MainWindow(QMainWindow):
                 if any(math.dist(point, marker) <= ft.SELECTION_TOLERANCE for marker in markers["face"]):
                     faces.append(pick.triangles.reshape(-1, 3, 3)[pick.triangle_face == number].reshape(-1, 3))
         return faces + profile_faces, edges
+
+    def _set_edge_geometry(self) -> list[list]:
+        """Je Farbe der Auswahlsätze (handles.SET_COLORS) die Kantenstriche der abgeschlossenen Sätze der offenen
+        Rundung/Fase – so sieht man wie in Fusion, welche Kanten zu welchem Satz und Pfeil gehören (Runde 92)."""
+        groups = [[] for _colour in handles.SET_COLORS]
+        if self._live is None or self._live.get("session") is not None \
+                or not 0 <= self._live["index"] < len(self.timeline.features):
+            return groups
+        feature = self.timeline.features[self._live["index"]]
+        sets = getattr(feature, "sets", None) if isinstance(feature, (ft.Fillet, ft.Chamfer)) else None
+        before = self.timeline.state_before(self._live["index"])
+        if not sets or feature.body not in before.bodies:
+            return groups
+        shape = before.bodies[feature.body]
+        key = id(shape)
+        if key not in self._pick_cache:
+            self._pick_cache[key] = (shape, mesh.pick_mesh(shape))
+        pick = self._pick_cache[key][1]
+        points = [ft.edge_point(edge) for edge in ft.unique_edges(shape)]
+        for number, entry in enumerate(sets):
+            for edge_number, point in enumerate(points):
+                if any(math.dist(point, marker) <= ft.SELECTION_TOLERANCE for marker in entry["edge_points"]):
+                    groups[number % len(groups)].append(
+                        pick.segments.reshape(-1, 2, 3)[pick.segment_edge == edge_number].reshape(-1, 3))
+        return groups
 
     def _show_measurement(self) -> None:
         """Messen: Werte der Auswahl oben links, bei zwei Elementen dazu die Abstandslinie im Modell."""
@@ -3002,18 +3464,31 @@ class MainWindow(QMainWindow):
         form.changed.connect(self._live_changed)
         if isinstance(form, FeatureForm):
             form.cleared.connect(self._live_cleared)
+            form.new_set.connect(self._new_selection_set)
+            form.set_edited.connect(self._edit_selection_set)
+            form.set_removed.connect(self._remove_selection_set)
             form.field_activated.connect(self._combine_field_clicked)
         old = {key: value for key, value in feature.to_dict().items() if key != "kind"}
         # Beim allerersten Schritt gibt es noch nichts, woran sich die Ansicht orientieren könnte;
         # sie wird deshalb nach dem Bestätigen auf das Modell eingepasst
         self._live = {"index": index, "new": is_new, "old": old, "form": form,
                       "fit": is_new and index == 0}
+        if not is_new and index + 1 < self.timeline.marker:
+            # Wie Fusion (Runde 93): beim nachträglichen Bearbeiten rollt die Timeline bis hinter diesen Schritt
+            # zurück. Jeder Zug am Pfeil, jede Eingabe rechnet dann nur noch diesen einen Schritt – nicht mehr alle
+            # späteren (mit Probeläufen); die rechnet _finish_live einmal beim Bestätigen.
+            self._live["rolled"] = self.timeline.marker
+            self.timeline.set_marker(index + 1)
+            self._refresh()
+            self.statusBar().showMessage("Timeline bis zu diesem Schritt zurückgerollt – die späteren Schritte "
+                                         "folgen beim Bestätigen (wie Fusion)", 6000)
         self._panel_title.setText(feature.KIND)
         self._panel_form.addWidget(form)
         self.panel_dock.show()
         if isinstance(feature, solids.CombineBodies):
             self._sync_combine_form()           # aktives Feld, Farben und Hinweis gleich zu Beginn
         self.viewport.set_handles([], active=0)     # neues Werkzeug: Hauptmaß zuerst
+        self._handles_followed = None               # seine Pfeile dürfen die Kamera einmal zurückweichen lassen
         self._update_handle()
 
     def _live_changed(self) -> None:
@@ -3062,9 +3537,21 @@ class MainWindow(QMainWindow):
         if self._live is None or handle is None:
             return
         feature = self.timeline.features[self._live["index"]]
+        if handle.parameter.startswith("sets."):
+            # Pfeil eines abgeschlossenen Auswahlsatzes (Rundung/Fase, Runde 92): nur sein Maß ändert sich
+            self.viewport.take_handle_expression()
+            number = int(handle.parameter.split(".", 1)[1])
+            size = "radius" if isinstance(feature, ft.Fillet) else "distance"
+            sets = [dict(entry) for entry in feature.sets]
+            if number < len(sets):
+                sets[number][size] = float(value)
+                self.timeline.update(self._live["index"], sets=sets)
+                self._live["form"].set_list("sets", sets)
+                self._refresh()
+            return
         expression = self.viewport.take_handle_expression()
-        if handle.parameter in ("count", "second_count"):
-            value = float(max(1, round(value)))      # eine Anzahl ist ganzzahlig
+        if handle.parameter in ("count", "second_count", "teeth"):
+            value = float(max(1, round(value)))      # eine Anzahl ist ganzzahlig (auch die Zähnezahl)
         editor = getattr(self._live["form"], "_editors", {}).get(handle.parameter)
         if expression and isinstance(editor, ExpressionBox):
             # Am Pfeil wurde ein Ausdruck eingetippt: das Maß hängt ab jetzt daran
@@ -3116,8 +3603,15 @@ class MainWindow(QMainWindow):
             axis = solids.AXES[self._section["axis"]]
             self._handles = [handles.Handle((0.0, 0.0, 0.0), tuple(float(c) for c in axis), "section",
                                             self._section["offset"], color=(0.36, 0.62, 1.00))]
+        # Die Kamera weicht nur einmal zurück, wenn die Pfeile eines Werkzeugs erscheinen – nicht nach jeder
+        # Neuberechnung: sonst zoomte sie beim Ziehen und nach dem Loslassen immer weiter heraus (Runde 90)
+        owner = (("live", self._live["index"]) if self._live is not None
+                 else ("section",) if self._handles else None)
+        follow = bool(self._handles) and owner != getattr(self, "_handles_followed", None)
+        if follow:
+            self._handles_followed = owner
         # Der aktive Pfeil bleibt aktiv, solange dasselbe Feature bearbeitet wird
-        self.viewport.set_handles(self._handles)
+        self.viewport.set_handles(self._handles, follow=follow)
         self._update_hole_grip()
         self._update_operation_bar()
 
@@ -3141,8 +3635,12 @@ class MainWindow(QMainWindow):
     def _awaiting_selection(self, feature) -> bool:
         """Wartet das Werkzeug noch auf die Auswahl dessen, was es ändern soll? Dann gibt es wie in Fusion noch
         keinen Pfeil, und die Timeline zeigt den Schritt nicht als Fehler."""
+        if isinstance(feature, ft.Fillet) and feature.fillet_type == ft.FILLET_KINDS[1]:
+            return feature.rule_scope == ft.RULE_SCOPES[1] and not feature.face_points
+        if isinstance(feature, ft.Fillet) and feature.fillet_type == ft.FILLET_KINDS[2]:
+            return not feature.face_points
         if isinstance(feature, (ft.Fillet, ft.Chamfer)):
-            return feature.require_pick and not feature.edge_points
+            return feature.require_pick and not feature.edge_points and not feature.sets
         if isinstance(feature, (sm.EdgeFlange, ex.Hem, mt.Rip)):
             return not feature.edge_points
         if isinstance(feature, (solids.Shell, solids.Draft)):
@@ -3155,7 +3653,16 @@ class MainWindow(QMainWindow):
         if isinstance(feature, solids.Hole):
             return (feature.require_pick and not feature.frame and feature.base == ft.NO_BASE
                     and feature.points_sketch == solids.NO_SKETCH)
-        return False
+        # Runde 93: Werkzeuge an einem Flächen- bzw. Netzkörper warten wie in Fusion zuerst auf diesen (auch
+        # wenn sie bei 0 starten und deshalb noch keinen Fehler melden)
+        if hasattr(feature, "surface") and isinstance(feature.surface, str) and not feature.surface:
+            return True
+        if hasattr(feature, "mesh") and isinstance(feature.mesh, str) and not feature.mesh:
+            return True
+        # Runde 93: alle übrigen Werkzeuge, deren Schritt nur meldet, dass noch etwas anzuklicken ist (Körper,
+        # Netz, Fläche, Kante …) – wie in Fusion wartet das Werkzeug dann auf die Auswahl, statt rot zu scheitern
+        index = next((number for number, step in enumerate(self.timeline.features) if step is feature), None)
+        return index is not None and _asks_for_selection(self.timeline.errors.get(index, ""))
 
     def _update_hole_grip(self) -> None:
         """Griffpunkt auf der Mitte der offenen Bohrung (sonst keiner)."""
@@ -3244,6 +3751,8 @@ class MainWindow(QMainWindow):
 
     def _finish_live(self, accept: bool) -> None:
         """Beendet das laufende Bearbeiten: übernehmen oder verwerfen."""
+        if self._sculpt is not None:
+            self._end_sculpt(accept)    # auch der Formen-Modus endet (OK/Abbrechen, anderes Werkzeug)
         if accept:
             self.viewport.commit_value_box()    # Enter bestätigt auch eine gerade eingetippte Länge (wie Fusion)
         self._restore_light_handle()    # nie mit der Ersatz-Operation der leichten Vorschau übernehmen
@@ -3270,6 +3779,9 @@ class MainWindow(QMainWindow):
         if self._pending_presspull:
             self._pending_presspull = False
             self.viewport.show_info("")
+        if self._pending_pick is not None:
+            self._pending_pick = None
+            self.viewport.show_info("")
         if self._live is None:
             return
         live, self._live = self._live, None
@@ -3283,18 +3795,30 @@ class MainWindow(QMainWindow):
             drawn = [index for index in range(len(session.canvas.entities)) if index not in session.canvas.projected]
             if accept and live["new"] and not drawn and not session.canvas.texts:
                 accept = False      # eine neue Skizze ohne eigenen Inhalt (nur der projizierte Umriss) entfällt
+        unchanged = lambda: {key: value for key, value in self.timeline.features[live["index"]].to_dict().items()
+                             if key != "kind"} == live["old"]
         if accept:
             # Noch nicht bestätigte Eingaben mitnehmen
             live["form"].commit()
-            self.timeline.update(live["index"], **live["form"].values())
+            values = live["form"].values()
+            feature = self.timeline.features[live["index"]]
+            if not (live.get("rolled") is not None and unchanged()
+                    and all(getattr(feature, key, None) == value for key, value in values.items())):
+                self.timeline.update(live["index"], **values)
+            # (unverändert und zurückgerollt: kein Neurechnen – set_marker holt unten den gemerkten Endstand)
         elif live["new"]:
             self.timeline.remove(live["index"])
             if self._undo_stack:
                 self._undo_stack.pop()      # der Rückgängig-Punkt dieses Werkzeugs entfällt
         else:
-            self.timeline.update(live["index"], **live["old"])
+            if not (live.get("rolled") is not None and unchanged()):
+                self.timeline.update(live["index"], **live["old"])
             if self._undo_stack:
                 self._undo_stack.pop()
+        if live.get("rolled") is not None:
+            # zurückgerollt bearbeitet: jetzt einmal alle späteren Schritte rechnen (beim Abbrechen kommt der
+            # gemerkte Endstand zurück, wenn sich nichts geändert hat)
+            self.timeline.set_marker(live["rolled"])
         live["form"].setParent(None)
         live["form"].deleteLater()
         self.panel_dock.hide()
@@ -3307,6 +3831,9 @@ class MainWindow(QMainWindow):
         marking = getattr(self, "_marking", None)
         if marking is not None and marking.isVisible():
             marking.close()         # ein offenes rundes Menü schließt zuerst
+            return
+        if self._sculpt is not None:
+            self._end_sculpt(False)     # Formen abbrechen: das Netz bleibt, wie es war
             return
         workspace = getattr(self, "_print_workspace", None)
         if workspace is not None and self._documents.currentWidget() is workspace and workspace.escape():
@@ -3322,6 +3849,10 @@ class MainWindow(QMainWindow):
             return
         if self._pending_presspull:
             self._pending_presspull = False
+            self.viewport.show_info("")
+            return
+        if self._pending_pick is not None:
+            self._pending_pick = None
             self.viewport.show_info("")
             return
         session = self._live.get("session") if self._live is not None else None
@@ -3596,9 +4127,10 @@ class MainWindow(QMainWindow):
             return
         planes = list(self.timeline.state.planes)
         if not planes:
-            QMessageBox.information(self, "Fläche ersetzen",
-                                    "Zuerst eine Konstruktionsebene anlegen – oder zwei Flächen anklicken: erst die "
-                                    "zu ersetzende, dann die Ersatzfläche an einem anderen Körper.")
+            faces = lambda: [(body, index) for kind, body, index in self._selection if kind == "face"]
+            ready = lambda: len(faces()) == 2 and faces()[0][0] != faces()[1][0]
+            self._await_picks("Fläche ersetzen", "erst die zu ersetzende Fläche anklicken, dann die Ersatzfläche an "
+                              "einem anderen Körper.", lambda: ready() and (self._create_replace_face() or True))
             return
         self._create(solids.ReplaceFace(target=planes[-1]))
 
@@ -4186,12 +4718,107 @@ class MainWindow(QMainWindow):
         self._refresh()
         self.viewport.show_info("Bewegung läuft – " + self._collision_text())
 
+    # --- Formen (Sculpting, Runde 94) -----------------------------------------------------------------------
+
+    def _start_sculpt(self, index: int | None = None) -> bool:
+        """Formen-Modus wie in Blender (siehe gui/sculpt_ui.py). Neu: am gewählten Netzkörper (ein gewählter
+        Volumenkörper wird erst in ein feines Netz umgewandelt); ohne Auswahl wartet das Werkzeug auf einen Klick.
+        Mit `index`: einen vorhandenen Schritt „Formen“ weiterformen (Timeline bis dorthin zurückgerollt)."""
+        self._finish_live(True)
+        rolled = None
+        if index is not None:
+            step = self.timeline.features[index]
+            if index + 1 < self.timeline.marker:
+                rolled = self.timeline.marker
+                self.timeline.set_marker(index + 1)
+            source = self.timeline.state_before(index).meshes.get(step.mesh)
+            if source is None and not step.data:
+                QMessageBox.information(self, "Formen", f"Netzkörper '{step.mesh}' ist nicht (mehr) vorhanden.")
+                return False
+            mesh = sc.SculptMesh.unpack(step.data) if step.data else sc.SculptMesh.from_triangles(source)
+            name = step.mesh
+        else:
+            state = self.timeline.state
+            chosen = [body for _kind, body, _number in self._selection]
+            meshes = [body for body in chosen if body in state.meshes]
+            solids_ = [body for body in chosen if body in state.bodies]
+            if not meshes and not solids_ and len(state.meshes) == 1 and not state.bodies:
+                meshes = list(state.meshes)
+            if not meshes and not solids_:
+                self._await_picks("Formen", "Netzkörper oder Volumenkörper anklicken, der geformt werden soll.",
+                                  lambda: bool(self._selection) and self._start_sculpt())
+                return False
+            if meshes:
+                name = meshes[0]
+            else:
+                # Volumenkörper: zuerst fein in ein Netz umwandeln (wie Blender ein Objekt als Netz formt)
+                self._remember()
+                before = set(state.meshes)
+                body = solids_[0]
+                low, high = np.array(solids._bounds(state.bodies[body])).reshape(2, 3)
+                deflection = max(float(np.linalg.norm(high - low)) / 400, 0.01)
+                self.timeline.add(ms.BodyToMesh(name=self.timeline.unique_name("Netz"), body=body,
+                                                deflection=deflection, angle=0.08))
+                created = [mesh for mesh in self.timeline.state.meshes if mesh not in before]
+                if not created:
+                    QMessageBox.information(self, "Formen", "Der Körper ließ sich nicht in ein Netz umwandeln.")
+                    return False
+                name = created[0]
+            mesh = sc.SculptMesh.from_triangles(self.timeline.state.meshes[name])
+        session = SculptSession(self, name, mesh, index)
+        session.rolled = rolled
+        session.was_hidden = name in self._hidden_bodies
+        self._hidden_bodies.add(name)           # das Netz zeigt die Sitzung selbst (Ebene „sculpt_mesh“)
+        self._clear_selection()
+        self._sculpt = session
+        self.viewport.sketch_input = session
+        self._panel_title.setText("Formen (Sculpting)")
+        self._panel_form.addWidget(session.panel)
+        self.panel_dock.show()
+        self.viewport.show_info("Formen: linke Maustaste formt, Strg umgekehrt, Umschalt glättet – Pinsel per Taste "
+                                "wie in Blender (X, C, I, G, S, P, M …). Eingabe/OK übernimmt, Esc bricht ab.")
+        self._refresh()
+        self.viewport.setFocus()
+        return True
+
+    def _end_sculpt(self, accept: bool) -> None:
+        """Formen beenden: das geformte Netz als Schritt „Formen“ übernehmen (bzw. den vorhandenen ändern)."""
+        session, self._sculpt = self._sculpt, None
+        if session is None:
+            return
+        session.close()
+        self.viewport.sketch_input = None
+        self.viewport.show_info("")
+        session.panel.setParent(None)
+        session.panel.deleteLater()
+        if accept and session.changed:
+            data = session.mesh.pack()
+            if session.index is None:
+                self._remember()
+                self.timeline.add(sc.SculptStep(name=self.timeline.unique_name("Formen"), mesh=session.mesh_name,
+                                                data=data))
+            else:
+                self.timeline.update(session.index, data=data)
+        if session.rolled is not None:
+            self.timeline.set_marker(session.rolled)
+        if not session.was_hidden:
+            self._hidden_bodies.discard(session.mesh_name)
+        self.panel_dock.hide()
+        self._refresh()
+
+    def _await_picks(self, title: str, hint: str, attempt) -> None:
+        """Wie in Fusion: das Werkzeug öffnet und wartet auf Klicks im Modell, statt mit einem Hinweisfenster
+        abzubrechen (Runde 93). `attempt()` versucht nach jedem Klick, den Schritt anzulegen (True: angelegt)."""
+        self._finish_live(True)
+        self._pending_pick = {"title": title, "attempt": attempt}
+        self.viewport.show_info(f"{title}: {hint} Esc bricht ab.")
+
     def _create_component(self) -> None:
         """Fasst die gewählten Körper zu einer Komponente zusammen."""
         bodies = list(dict.fromkeys(body for _kind, body, _index in self._selection))
         if not bodies:
-            QMessageBox.information(self, "Komponente", "Bitte zuerst einen oder mehrere Körper anklicken "
-                                    "(Strg+Klick wählt weitere).")
+            self._await_picks("Komponente", "Körper anklicken, die zur Komponente gehören.",
+                              lambda: bool(self._selection) and (self._create_component() or True))
             return
         # Ein Schritt in der Timeline, auch bei mehreren Körpern
         self._create(solids.Component(body=bodies[0], bodies=bodies[1:]))
@@ -4200,9 +4827,9 @@ class MainWindow(QMainWindow):
         """Fügt den Körper der ersten gewählten Fläche an die zweite gewählte Fläche."""
         chosen = list(self._selection)
         if len(chosen) != 2 or chosen[0][1] == chosen[1][1]:
-            QMessageBox.information(self, "Gelenk", "Bitte zwei Bezüge an zwei verschiedenen Körpern wählen – "
-                                    "Flächen oder Kanten (z. B. den Rand einer Bohrung): zuerst am Körper, der "
-                                    "bewegt werden soll, dann mit Strg+Klick dort, wo er gefügt wird.")
+            ready = lambda: len(self._selection) == 2 and self._selection[0][1] != self._selection[1][1]
+            self._await_picks("Gelenk", "zuerst Fläche oder Kante am Körper anklicken, der bewegt wird, dann den "
+                              "Bezug am anderen Körper.", lambda: ready() and (self._create_joint() or True))
             return
         points = [list(self._picks[body].face_points[index] if kind == "face" else
                        self._picks[body].edge_points[index] if kind == "edge" else
@@ -4267,8 +4894,9 @@ class MainWindow(QMainWindow):
                 found.append(faces[index])
         return found
 
-    def _create_axis(self) -> None:
-        """Konstruktionsachse: durch eine gerade Kante, die Achse einer Bohrung/Welle oder zwei Eckpunkte."""
+    def _create_axis(self) -> bool:
+        """Konstruktionsachse: durch eine gerade Kante, die Achse einer Bohrung/Welle oder zwei Eckpunkte. Ohne
+        passende Auswahl wartet das Werkzeug auf Klicks (True, sobald die Achse angelegt ist)."""
         state = self.timeline.state
         points = None
         faces = self._selected_faces()
@@ -4291,10 +4919,12 @@ class MainWindow(QMainWindow):
         elif len(corners) == 2 and len(self._selection) == 2:
             points = [[float(c) for c in self._vertex_points(body)[index]] for body, index in corners]
         if points is None:
-            QMessageBox.information(self, "Achse", "Vor dem Werkzeug wählen: eine gerade oder runde Kante, eine "
-                                    "zylindrische Fläche (Bohrung, Welle) oder zwei Eckpunkte.")
-            return
+            if self._pending_pick is None or self._pending_pick.get("title") != "Achse":
+                self._await_picks("Achse", "gerade oder runde Kante, Zylinderfläche (Bohrung, Welle) oder zwei "
+                                  "Eckpunkte anklicken.", self._create_axis)
+            return False
         self._create(solids.ConstructionAxis(start=list(points[0]), end=list(points[1])))
+        return True
 
     def _create_plane(self) -> None:
         """Legt eine Konstruktionsebene an: versetzt zur gewählten ebenen Fläche oder zu einer Hauptebene."""
@@ -4372,7 +5002,7 @@ class MainWindow(QMainWindow):
                                 axes=self.timeline.state.frames.get(feature.name),
                                 resolver=lambda text: pm.evaluate(text, self.timeline.parameter_values),
                                 construction=list(feature.construction), edge_picker=self._edges_at,
-                                vertex_picker=self._vertex_at,
+                                vertex_picker=self._vertex_at, section_picker=self._section_at,
                                 texts=[list(entry) for entry in feature.texts],
                                 centerlines=list(feature.centerlines), projected=list(feature.projected))
         if face_edges:
@@ -4944,19 +5574,39 @@ class MainWindow(QMainWindow):
         self._create(kind(sketch=sketches[-1]))
 
     def _insert_mesh(self) -> None:
-        """Netz einfügen: STL wählen, Dreiecke lesen und gepackt im Schritt speichern."""
+        """Netz einfügen: eine oder mehrere Dateien wählen (Runde 97; STL, OBJ, 3MF, STEP), je Objekt ein Schritt
+        mit den gepackten Dreiecken."""
         start = str(self.data_panel.folder) if self.data_panel.folder else ""
-        path, _ = QFileDialog.getOpenFileName(self, "Netz einfügen", start, "STL-Netze (*.stl)")
-        if not path:
-            return
-        try:
-            triangles = ms.read_stl(path)
-        except (ft.FeatureError, OSError) as error:
-            QMessageBox.critical(self, "Netz einfügen", str(error))
-            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "Netze einfügen", start, ms.MESH_FILE_FILTER)
+        self.insert_mesh_files(paths)
+
+    def insert_mesh_files(self, paths: list[str]) -> int:
+        """Fügt alle Objekte der Dateien als Netzkörper ein; gibt ihre Anzahl zurück."""
+        found, problems = [], []
+        for path in paths:
+            try:
+                found += [(path, triangles) for _name, triangles in ms.read_mesh_file(path)]
+            except (ft.FeatureError, OSError) as error:
+                problems.append(f"{Path(path).name}: {error}")
+        if problems:
+            QMessageBox.warning(self, "Netze einfügen", "Nicht gelesen:\n" + "\n".join(problems))
+        if not found:
+            return 0
         self._finish_live(True)
-        self._create(ms.MeshImport(source=path, data=ms.pack(triangles)))
-        self.statusBar().showMessage(f"{len(triangles)} Dreiecke eingefügt", 6000)
+        if len(found) == 1:
+            # ein Netz: wie bisher als laufendes Werkzeug (Eingabe bestätigt)
+            path, triangles = found[0]
+            self._create(ms.MeshImport(source=path, data=ms.pack(triangles)))
+        else:
+            # mehrere: alle auf einmal als fertige Schritte, ein Rückgängig-Schritt für alle
+            first = not self.timeline.features
+            self._remember()
+            for path, triangles in found:
+                self.timeline.add(ms.MeshImport(source=path, data=ms.pack(triangles)))
+            self._refresh(fit=True)             # alle neuen Netze ins Bild
+        count = sum(len(triangles) for _path, triangles in found)
+        self.statusBar().showMessage(f"{len(found)} Netz(e) mit {count} Dreiecken eingefügt", 6000)
+        return len(found)
 
     def _save_mesh(self, name: str | None) -> None:
         """Netzkörper als STL speichern (ohne Angabe: der gewählte bzw. einzige)."""
@@ -5355,10 +6005,15 @@ class MainWindow(QMainWindow):
     def _create_loft(self) -> None:
         sketches = [name for name in self._active_sketch_names() if name in self.timeline.state.profiles]
         if len(sketches) < 2:
-            QMessageBox.information(self, "Erhebung", "Die Erhebung braucht mindestens zwei Skizzen mit "
-                                    "geschlossenem Profil (z. B. auf versetzten Ebenen).")
+            enough = lambda: len([name for name in self._active_sketch_names()
+                                  if name in self.timeline.state.profiles]) >= 2
+            self._await_picks("Erhebung", "die Profile nacheinander anklicken (mindestens zwei Skizzen).",
+                              lambda: enough() and (self._create_loft() or True))
             return
-        self._create(solids.Loft(sketch=sketches[-2], sketch2=sketches[-1],
+        # wie Fusion: alle gewählten Profile in der Reihenfolge der Auswahl (bisher nur die letzten zwei)
+        chosen = sketches if len(sketches) > 2 and self._selected_profiles else sketches[-2:]
+        self._create(solids.Loft(sketch=chosen[0], sketch2=chosen[1],
+                                 sketch3=chosen[2] if len(chosen) > 2 else solids.NO_SKETCH, more=chosen[3:],
                                  operation=self._default_operation()))
 
     def _edit(self, index: int) -> None:
@@ -5372,6 +6027,9 @@ class MainWindow(QMainWindow):
         if isinstance(feature, sketch.Sketch):
             # Freie Skizzen werden in der 3D-Ansicht weitergezeichnet
             self._start_sketch(index, False, None)
+            return
+        if isinstance(feature, sc.SculptStep):
+            self._start_sculpt(index)       # Formen: im Formen-Modus weiterformen
             return
         self._begin_live(index, False)
 

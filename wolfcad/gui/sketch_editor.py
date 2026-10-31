@@ -36,13 +36,14 @@ from .icons import icon
 DIMENSION_TOOL = "Bemaßung"
 FILLET_TOOL, TRIM_TOOL, CONSTRUCTION_TOOL = "Abrunden", "Stutzen", "Konstruktion"
 MIRROR_TOOL, OFFSET_TOOL, PROJECT_TOOL = "Spiegeln", "Versatz", "Projizieren"
+INTERSECT_TOOL = "Schnittkurve"     # Fusion „Schneiden“: wo ein Körper die Skizzenebene schneidet (Runde 96)
 PATTERN_TOOL, CIRCULAR_TOOL = "Muster", "Kreismuster"
 EXTEND_TOOL, BREAK_TOOL = "Verlängern", "Brechen"
 CHAMFER_TOOL, SCALE_TOOL, BLEND_TOOL = "Fase", "Skizze skalieren", "Übergangskurve"
 MOVE_TOOL = "Verschieben/Kopieren"
 # verändern oder vervielfältigen vorhandene Elemente per Klick
 EDIT_TOOLS = (FILLET_TOOL, CHAMFER_TOOL, TRIM_TOOL, EXTEND_TOOL, BREAK_TOOL, CONSTRUCTION_TOOL, MIRROR_TOOL,
-              OFFSET_TOOL, PROJECT_TOOL, PATTERN_TOOL, CIRCULAR_TOOL, SCALE_TOOL, BLEND_TOOL, MOVE_TOOL)
+              OFFSET_TOOL, PROJECT_TOOL, INTERSECT_TOOL, PATTERN_TOOL, CIRCULAR_TOOL, SCALE_TOOL, BLEND_TOOL, MOVE_TOOL)
 TEXT_TOOL = "Text"
 # weitere Zeichenwerkzeuge wie in Fusion
 CENTER_RECT, THREE_POINT_RECT = "Mittelpunkt-Rechteck", "3-Punkt-Rechteck"
@@ -66,7 +67,7 @@ _TOOL_ICONS = {"Auswählen": "select", "Linie": "line", "Rechteck": "rectangle",
                cs.DISTANCE: "distance", cs.ANGLE: "angle", cs.TANGENT: "tangent", cs.POINT_ON: "point_on",
                "Polygon": "polygon", "Langloch": "slot", FILLET_TOOL: "sketch_fillet", TRIM_TOOL: "trim",
                CONSTRUCTION_TOOL: "construction", MIRROR_TOOL: "sketch_mirror", OFFSET_TOOL: "offset",
-               PROJECT_TOOL: "project", sk.SPLINE: "spline", cs.FIX: "fix", sk.ELLIPSE: "ellipse", sk.CONIC: "conic", sk.CP_SPLINE: "cp_spline",
+               PROJECT_TOOL: "project", INTERSECT_TOOL: "sketch_intersect", sk.SPLINE: "spline", cs.FIX: "fix", sk.ELLIPSE: "ellipse", sk.CONIC: "conic", sk.CP_SPLINE: "cp_spline",
                PATTERN_TOOL: "sketch_pattern", CIRCULAR_TOOL: "sketch_pattern_circular", TEXT_TOOL: "text",
                CENTER_RECT: "rect_center", THREE_POINT_RECT: "rect_3point", THREE_POINT_CIRCLE: "circle_3point",
                TWO_POINT_CIRCLE: "circle_2point", THREE_POINT_ARC: "arc_3point", TANGENT_ARC: "arc_tangent",
@@ -1213,9 +1214,12 @@ class SketchCanvas(QWidget):
             numbers.add(self.selected)
         return sorted(n for n in numbers if 0 <= n < len(self.entities))
 
-    def add_text(self, text: str, x: float, y: float, height: float, rotation: float = 0.0) -> bool:
-        """Setzt einen Text mit seiner linken unteren Ecke an (x, y); False, wenn er unbrauchbar ist."""
+    def add_text(self, text: str, x: float, y: float, height: float, rotation: float = 0.0, path: int = -1) -> bool:
+        """Setzt einen Text mit seiner linken unteren Ecke an (x, y); False, wenn er unbrauchbar ist. Mit `path`
+        (Nummer eines Elements) läuft er an diesem entlang; x ist dann der Abstand vom Anfang des Elements."""
         entry = [text.strip(), float(x), float(y), float(height), float(rotation)]
+        if path >= 0:
+            entry += ["", int(path)]
         problem = sk.check_text(entry)
         if problem is None:
             self.texts.append(entry)
@@ -1251,6 +1255,8 @@ class SketchCanvas(QWidget):
     def text_at(self, x: float, y: float) -> int | None:
         """Nummer des Textes, in dessen Feld der Punkt liegt (None, wenn dort keiner steht)."""
         for number, entry in enumerate(self.texts):
+            if len(entry) == 7:
+                continue                # Text am Pfad: kein Feld an (x, y) – x ist der Abstand entlang der Kurve
             try:
                 outline = sk.text_outline(entry[0], entry[3], entry[5] if len(entry) > 5 else "")
             except Exception:
@@ -1525,8 +1531,8 @@ class SketchCanvas(QWidget):
                 self.message = ""
                 self.changed.emit()
             return
-        if self.tool == PROJECT_TOOL:
-            # Körperkanten werden in der 3D-Ansicht getroffen; das erledigt die Skizzensitzung
+        if self.tool in (PROJECT_TOOL, INTERSECT_TOOL):
+            # Körperkanten bzw. -schnitte werden in der 3D-Ansicht getroffen; das erledigt die Skizzensitzung
             return
         actions = {FILLET_TOOL: self._fillet_at, TRIM_TOOL: self._trim_at, MIRROR_TOOL: self._mirror_at,
                    CHAMFER_TOOL: self._chamfer_at, SCALE_TOOL: self._scale_at, BLEND_TOOL: self._blend_at,
@@ -2263,8 +2269,9 @@ class SketchCanvas(QWidget):
         fixed = {rule[1] for rule in self.constraints if rule[0] == cs.FIX}
         reach = self._px(_SNAP_PIXELS)
         text = self.text_at(x, y)
-        if text is not None and self._entity_at(x, y) is None:
-            # Ein Text wird an seiner Fläche gegriffen und als Ganzes verschoben
+        if text is not None and self._entity_at(x, y) is None and len(self.texts[text]) < 7:
+            # Ein Text wird an seiner Fläche gegriffen und als Ganzes verschoben (ein Text am Pfad nicht: er sitzt
+            # auf seiner Kurve, sein Abstand steht in der Texttabelle)
             self.selected_text = text
             self._drag_text = (text, (x, y), tuple(self.texts[text][1:3]))
             self.changed.emit()
@@ -3002,6 +3009,7 @@ class SketchCanvas(QWidget):
                                           else "Spiegeln: Element anklicken"),
                             OFFSET_TOOL: f"Versatz ({self.offset_distance:g} mm): neben das Element klicken",
                             PROJECT_TOOL: "Projizieren: Kante oder Fläche eines Körpers anklicken",
+                            INTERSECT_TOOL: "Schnittkurve: Körper anklicken, den die Skizzenebene schneidet",
                             PATTERN_TOOL: f"Muster {int(self.pattern['nx'])} × {int(self.pattern['ny'])}: Element anklicken",
                             CIRCULAR_TOOL: f"Kreismuster {int(self.pattern['count'])}×: Element anklicken"}[self.tool]
             if self.tool == cs.FIX:

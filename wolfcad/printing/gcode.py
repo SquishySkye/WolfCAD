@@ -48,10 +48,25 @@ class Toolpath:
     travel_layers: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int32))
     layer_heights: list[float] = field(default_factory=list)          # Z je Schicht
     info: dict[str, str] = field(default_factory=dict)                # Druckzeit, Filament …
+    # Runde 92 (Ablauf wie im Original): laufende Nummer jeder Strecke in Druckreihenfolge (über alle Arten
+    # hinweg, Fahrwege eingeschlossen) und Bahnbreite aus „;WIDTH:“ (für die Darstellung als Körper)
+    orders: dict[str, np.ndarray] = field(default_factory=dict)       # Art -> (n,) int64, aufsteigend
+    widths: dict[str, np.ndarray] = field(default_factory=dict)       # Art -> (n,) float32 in mm
+    travel_orders: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    layer_first: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))    # erste Nummer je Schicht
+    layer_last: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))     # letzte Nummer je Schicht
 
     @property
     def layer_count(self) -> int:
         return len(self.layer_heights)
+
+    def thickness(self, layer: int) -> float:
+        """Schichtdicke: Abstand zur Schicht darunter (die erste Schicht liegt auf dem Bett)."""
+        if not self.layer_heights:
+            return 0.2
+        layer = min(max(layer, 0), len(self.layer_heights) - 1)
+        below = self.layer_heights[layer - 1] if layer > 0 else 0.0
+        return float(min(max(self.layer_heights[layer] - below, 0.04), 1.0))
 
 
 _NUMBER = re.compile(r"([XYZEFIJR])(-?\d*\.?\d+)")
@@ -70,7 +85,10 @@ def read(path: str | Path, max_segments: int = 6_000_000) -> Toolpath:
     """Liest eine G-Code-Datei; sehr große Dateien werden bis `max_segments` Strecken gelesen."""
     collected: dict[str, list] = {}
     layer_of: dict[str, list] = {}
-    travel, travel_layer = [], []
+    order_of: dict[str, list] = {}
+    width_of: dict[str, list] = {}
+    travel, travel_layer, travel_order = [], [], []
+    width = 0.45                        # Bahnbreite, bis der G-Code eine nennt (;WIDTH:)
     heights: list[float] = []
     info: dict[str, str] = {}
     x = y = z = e = 0.0
@@ -87,7 +105,12 @@ def read(path: str | Path, max_segments: int = 6_000_000) -> Toolpath:
                 continue
             if line[0] == ";":
                 text = line[1:].strip()
-                if text.startswith("TYPE:"):
+                if text.startswith("WIDTH:"):
+                    try:
+                        width = float(text[6:])
+                    except ValueError:
+                        pass
+                elif text.startswith("TYPE:"):
                     kind = text[5:].strip()
                     if kind not in FEATURES:
                         kind = OTHER
@@ -146,9 +169,12 @@ def read(path: str | Path, max_segments: int = 6_000_000) -> Toolpath:
                         if extruding:
                             collected.setdefault(kind, []).append((start, point))
                             layer_of.setdefault(kind, []).append(max(layer, 0))
+                            order_of.setdefault(kind, []).append(count)
+                            width_of.setdefault(kind, []).append(width)
                         elif (point[0], point[1]) != (start[0], start[1]):
                             travel.append((start, point))
                             travel_layer.append(max(layer, 0))
+                            travel_order.append(count)
                         count += 1
                     start = point
                 x, y, z = nx, ny, nz
@@ -161,10 +187,54 @@ def read(path: str | Path, max_segments: int = 6_000_000) -> Toolpath:
     for name, items in collected.items():
         path_data.segments[name] = np.asarray(items, dtype=np.float32).reshape(-1, 2, 3)
         path_data.layers[name] = np.maximum(np.asarray(layer_of[name], dtype=np.int32) - shift, 0)
+        path_data.orders[name] = np.asarray(order_of[name], dtype=np.int64)
+        path_data.widths[name] = np.asarray(width_of[name], dtype=np.float32)
     if travel:
         path_data.travel = np.asarray(travel, dtype=np.float32).reshape(-1, 2, 3)
         path_data.travel_layers = np.maximum(np.asarray(travel_layer, dtype=np.int32) - shift, 0)
+        path_data.travel_orders = np.asarray(travel_order, dtype=np.int64)
+    _layer_bounds(path_data)
     return path_data
+
+
+def _layer_bounds(path: Toolpath) -> None:
+    """Erste und letzte laufende Nummer der gedruckten Strecken je Schicht (für den Ablauf-Regler)."""
+    count = max(path.layer_count, 1)
+    first = np.full(count, np.iinfo(np.int64).max, dtype=np.int64)
+    last = np.full(count, -1, dtype=np.int64)
+    for kind, layers in path.layers.items():
+        if len(layers):
+            clipped = np.minimum(layers, count - 1)
+            np.minimum.at(first, clipped, path.orders[kind])
+            np.maximum.at(last, clipped, path.orders[kind])
+    # Schichten ohne gedruckte Strecke: an die Nachbarn anschließen, damit der Regler nicht springt
+    for layer in range(count):
+        if last[layer] < 0:
+            last[layer] = last[layer - 1] if layer else 0
+            first[layer] = last[layer]
+    path.layer_first, path.layer_last = first, last
+
+
+def solid_triangles(segments: np.ndarray, widths: np.ndarray, thickness: np.ndarray) -> np.ndarray:
+    """Strecken als flache Stränge wie im Original (Runde 92): je Strecke ein Quader aus Oberseite und zwei
+    Flanken (die Unterseite verdeckt die Schicht darunter), Breite = Bahnbreite, Höhe = Schichtdicke, an den
+    Enden um eine halbe Breite verlängert, damit Ecken geschlossen wirken. Ergebnis: (n, 18, 3) float32."""
+    start, end = segments[:, 0].astype(np.float32), segments[:, 1].astype(np.float32)
+    along = end - start
+    along[:, 2] = 0.0
+    length = np.linalg.norm(along, axis=1, keepdims=True)
+    flat = length[:, 0] < 1e-6
+    along = np.where(flat[:, None], np.array([1.0, 0.0, 0.0], np.float32), along / np.maximum(length, 1e-6))
+    half = (widths.astype(np.float32) / 2)[:, None]
+    side = np.stack([-along[:, 1], along[:, 0], np.zeros(len(along), np.float32)], axis=1) * half
+    start, end = start - along * half * 0.8, end + along * half * 0.8
+    down = np.zeros_like(start)
+    down[:, 2] = -thickness.astype(np.float32)
+    a_l, a_r, b_l, b_r = start + side, start - side, end + side, end - side
+    corners = [a_l, b_l, b_r, a_l, b_r, a_r,                            # Oberseite
+               a_l, a_l + down, b_l + down, a_l, b_l + down, b_l,      # linke Flanke
+               a_r, b_r, b_r + down, a_r, b_r + down, a_r + down]      # rechte Flanke
+    return np.stack(corners, axis=1).astype(np.float32)
 
 
 def _arc(x0, y0, x1, y1, z1, i, j, clockwise, step=1.0):

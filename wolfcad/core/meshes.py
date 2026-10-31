@@ -36,6 +36,117 @@ def read_stl(path: str) -> np.ndarray:
     return nodes[indices]
 
 
+# Dateiarten, aus denen Netze geladen werden können (Runde 97: mehrere Dateien auf einmal, auch OBJ/3MF/STEP)
+MESH_FILE_FILTER = "Modelle (*.stl *.obj *.3mf *.step *.stp);;STL (*.stl);;OBJ (*.obj);;3MF (*.3mf);;STEP (*.step *.stp)"
+
+
+def read_mesh_file(path: str) -> list[tuple[str, np.ndarray]]:
+    """Alle Objekte einer Modelldatei als [(Name, Dreiecke n × 3 × 3)]. STL und OBJ liefern ein Objekt, 3MF je
+    Objekt der Bauliste eines, STEP je Volumenkörper eines (fein vernetzt)."""
+    from pathlib import Path
+    file = Path(path)
+    suffix = file.suffix.lower()
+    if suffix == ".stl":
+        return [(file.stem, read_stl(str(file)))]
+    if suffix == ".obj":
+        return [(file.stem, read_obj(str(file)))]
+    if suffix == ".3mf":
+        return read_3mf(str(file))
+    if suffix in (".step", ".stp"):
+        from . import exchange
+        try:
+            shapes = exchange.read_step(str(file))
+        except exchange.ExchangeError as error:
+            raise FeatureError(str(error)) from error
+        found = [(file.stem if len(shapes) == 1 else f"{file.stem} {number}", tessellate(shape, 0.05))
+                 for number, shape in enumerate(shapes, 1)]
+        return [(name, triangles) for name, triangles in found if len(triangles)]
+    raise FeatureError(f"Unbekannte Dateiart '{file.suffix}' (STL, OBJ, 3MF oder STEP)")
+
+
+def read_obj(path: str) -> np.ndarray:
+    """Dreiecke einer Wavefront-OBJ-Datei; Vielecke werden als Fächer zerlegt, Texturen und Normalen übergangen."""
+    vertices, triangles = [], []
+    with open(path, encoding="utf-8", errors="replace") as source:
+        for line in source:
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == "v" and len(parts) >= 4:
+                vertices.append([float(value) for value in parts[1:4]])
+            elif parts[0] == "f" and len(parts) >= 4:
+                # „7/1/3“: nur die Ecknummer zählt; negative Nummern zählen vom Ende der bisherigen Ecken
+                corners = [int(part.split("/")[0]) for part in parts[1:]]
+                corners = [c - 1 if c > 0 else len(vertices) + c for c in corners]
+                triangles += [(corners[0], corners[i], corners[i + 1]) for i in range(1, len(corners) - 1)]
+    if not triangles:
+        raise FeatureError(f"Die OBJ-Datei '{path}' enthält keine Flächen")
+    return np.asarray(vertices, float)[np.asarray(triangles)]
+
+
+def read_3mf(path: str) -> list[tuple[str, np.ndarray]]:
+    """Objekte einer 3MF-Datei (Bauliste samt Lage; Komponenten werden mit ihrer Lage eingesetzt)."""
+    import zipfile
+    import xml.etree.ElementTree as ElementTree
+    space = "{http://schemas.microsoft.com/3dmanufacturing/core/2015/02}"
+    try:
+        with zipfile.ZipFile(path) as archive:
+            name = next((entry for entry in archive.namelist() if entry.lower().endswith(".model")
+                         and entry.lower().startswith("3d/")), None)
+            if name is None:
+                raise FeatureError(f"'{path}' enthält kein 3D-Modell")
+            root = ElementTree.fromstring(archive.read(name))
+    except (zipfile.BadZipFile, ElementTree.ParseError, OSError) as error:
+        raise FeatureError(f"'{path}' ist keine lesbare 3MF-Datei: {error}") from error
+
+    def matrix(text: str | None) -> np.ndarray:
+        """3MF-Lage „m00 m01 m02 m10 … m32“ (Zeilen, Verschiebung zuletzt) als 4 × 4-Matrix für Zeilenvektoren."""
+        result = np.eye(4)
+        if text:
+            values = [float(value) for value in text.split()]
+            result[:, :3] = np.asarray(values, float).reshape(4, 3)
+        return result
+
+    objects = {item.get("id"): item for item in root.iter(space + "object")}
+
+    def triangles_of(object_id: str, depth: int = 0) -> np.ndarray:
+        item = objects.get(object_id)
+        if item is None or depth > 8:
+            return np.zeros((0, 3, 3))
+        mesh = item.find(space + "mesh")
+        if mesh is not None:
+            points = np.array([[float(v.get(axis)) for axis in "xyz"] for v in mesh.iter(space + "vertex")])
+            corners = np.array([[int(t.get(key)) for key in ("v1", "v2", "v3")] for t in mesh.iter(space + "triangle")])
+            return points[corners] if len(corners) else np.zeros((0, 3, 3))
+        parts = []
+        for component in item.iter(space + "component"):
+            inner = triangles_of(component.get("objectid"), depth + 1)
+            parts.append(_transformed(inner, matrix(component.get("transform"))))
+        return np.concatenate(parts) if parts else np.zeros((0, 3, 3))
+
+    build = root.find(space + "build")
+    items = list(build.iter(space + "item")) if build is not None else []
+    if not items:              # ohne Bauliste: jedes Objekt mit Netz
+        items = [ElementTree.Element("item", objectid=key) for key in objects]
+    found = []
+    for number, item in enumerate(items, 1):
+        triangles = _transformed(triangles_of(item.get("objectid")), matrix(item.get("transform")))
+        if len(triangles):
+            label = objects[item.get("objectid")].get("name") if item.get("objectid") in objects else None
+            found.append((label or f"Objekt {number}", triangles))
+    if not found:
+        raise FeatureError(f"Die 3MF-Datei '{path}' enthält keine Dreiecke")
+    return found
+
+
+def _transformed(triangles: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    """Dreiecke mit einer 4 × 4-Lage (Zeilenvektoren, Verschiebung in der letzten Zeile)."""
+    if not len(triangles):
+        return triangles
+    points = triangles.reshape(-1, 3) @ matrix[:3, :3] + matrix[3, :3]
+    return points.reshape(-1, 3, 3)
+
+
 def write_stl(triangles: np.ndarray, path: str) -> None:
     """Dreiecke als binäre STL-Datei (mit berechneten Normalen)."""
     triangles = np.asarray(triangles, dtype=np.float32).reshape(-1, 3, 3)
@@ -59,15 +170,20 @@ def unpack(text: str) -> np.ndarray:
     return np.frombuffer(zlib.decompress(base64.b64decode(text)), dtype=np.float32).astype(float).reshape(-1, 3, 3)
 
 
-def tessellate(shape, deflection: float = 0.1) -> np.ndarray:
-    """Dreiecke eines Volumenkörpers (außen richtig herum ausgerichtet)."""
+def tessellate(shape, deflection: float = 0.1, angle: float = 0.3) -> np.ndarray:
+    """Dreiecke eines Volumenkörpers (außen richtig herum ausgerichtet); `angle`: größte Winkelabweichung (rad)."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepMesh import BRepMesh_IncrementalMesh
     from OCP.TopAbs import TopAbs_REVERSED
     from OCP.TopLoc import TopLoc_Location
     # nicht parallel: im Probelauf des Absturzschutzes (abgespaltener Prozess) fehlt der Thread-Pool des Kerns –
     # parallel zerlegt wartete das Kind ewig und lief in die 45-s-Grenze (Zufallstest Startwert 21)
-    BRepMesh_IncrementalMesh(shape, deflection, False, 0.3, False)
+    # auf einer Kopie ohne vorhandene Zerlegung: sonst behielt der Kern die gröbere Zerlegung der Anzeige (sie erfüllt
+    # die Abweichung in mm, der Winkel zählt dabei nicht) – das Netz hing davon ab, ob der Körper schon angezeigt war
+    # (Runde 94: Kugel zum Formen trotz feiner Einstellung grob)
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
+    shape = BRepBuilderAPI_Copy(shape, True, False).Shape()
+    BRepMesh_IncrementalMesh(shape, deflection, False, angle, False)
     found = []
     for face in ft.faces_of(shape):
         location = TopLoc_Location()
@@ -311,6 +427,9 @@ class BodyToMesh(Feature):
 
     body: str = ""
     deflection: float = 0.1
+    # größte Winkelabweichung der Zerlegung (rad): 0,3 grob wie bisher; zum Formen fein (Runde 94: eine Kugel
+    # blieb sonst trotz feiner Abweichung grob facettiert)
+    angle: float = 0.3
 
     KIND = "Körper in Netz umwandeln"
 
@@ -327,7 +446,9 @@ class BodyToMesh(Feature):
         box = Bnd_Box()
         BRepBndLib.Add_s(shape, box, False)
         diagonal = 0.0 if box.IsVoid() else box.SquareExtent() ** 0.5
-        state.add_mesh(tessellate(shape, max(self.deflection, diagonal / 5000.0)))
+        if not 0.01 <= self.angle <= 1.0:
+            raise FeatureError("Die Winkelabweichung liegt zwischen 0,01 und 1 (Bogenmaß)")
+        state.add_mesh(tessellate(shape, max(self.deflection, diagonal / 5000.0), self.angle))
 
 
 @dataclass

@@ -43,7 +43,7 @@ from OCP.BRepPrimAPI import (
 )
 from OCP.GeomAbs import GeomAbs_Circle, GeomAbs_Cone, GeomAbs_Cylinder, GeomAbs_Line, GeomAbs_Plane
 from OCP.GProp import GProp_GProps
-from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Dir2d, gp_GTrsf, gp_Pln, gp_Pnt, gp_Pnt2d, gp_Trsf, gp_Vec, gp_XYZ
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Dir2d, gp_GTrsf, gp_Pln, gp_Pnt, gp_Pnt2d, gp_Trsf, gp_Vec, gp_XYZ
 from OCP.TopAbs import (
     TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_REVERSED, TopAbs_SHELL, TopAbs_SOLID, TopAbs_WIRE,
 )
@@ -54,6 +54,7 @@ from OCP.collections import List_TopoDS_Shape
 
 from . import exchange
 from . import features as ft
+from . import guard
 from . import sketch
 from .features import ALL_BODIES, OPERATIONS, BuildState, Feature, FeatureError
 
@@ -369,6 +370,10 @@ class Sweep(Feature):
     placement: str = SWEEP_PLACEMENTS[0]        # Profil lassen, wo es gezeichnet ist, oder an den Pfadanfang setzen
     guide: str = NO_SKETCH                      # Skizze mit der Führungsschiene (NO_SKETCH: nur Pfad)
     guide_mode: str = GUIDE_MODES[0]
+    # --- seit Runde 96 (Fusion-Funktionen, nur ohne Führungsschiene) ---
+    distance: float = 1.0       # Anteil des Pfads (0 … 1), wie Fusions Schieber „Abstand“
+    twist: float = 0.0          # Verdrehung des Profils über die ganze Länge (Grad)
+    taper: float = 0.0          # Verjüngung (Grad): das Profil wird längs des Pfads um tan(Winkel)·Länge kleiner
 
     KIND = "Sweep"
 
@@ -384,20 +389,31 @@ class Sweep(Feature):
             if self.guide in (self.sketch, self.path):
                 raise FeatureError("Die Führungsschiene braucht eine eigene Skizze (nicht Profil oder Pfad)")
             rail = _path_wire(state, self.guide)
+        if not 0.0 < self.distance <= 1.0:
+            raise FeatureError("Der Abstand ist der Anteil des Pfads: größer als 0 und höchstens 1")
+        if not -60.0 < self.taper < 60.0:
+            raise FeatureError("Die Verjüngung liegt zwischen −60 und 60 Grad")
         profile, spine = _outline(state, self.sketch), _path_wire(state, self.path)
+        if self.distance < 1.0:
+            spine = _partial_wire(spine, self.distance)
         holes = _inner_wires(state, self.sketch)
         if self.placement == SWEEP_PLACEMENTS[1]:
             # Profil mittig an den Anfang des Pfads setzen und quer zu ihm drehen
             move = _to_path_start(profile, state.normals[self.sketch], spine)
             profile = TopoDS.Wire(BRepBuilderAPI_Transform(profile, move, True).Shape())
             holes = [TopoDS.Wire(BRepBuilderAPI_Transform(hole, move, True).Shape()) for hole in holes]
-        solid = self._swept(spine, profile, rail, self.guide_mode)
+        shaped = abs(self.twist) > 1e-9 or abs(self.taper) > 1e-9
+        if shaped and rail is not None:
+            raise FeatureError("Verdrehung und Verjüngung gehen nur ohne Führungsschiene")
+        sweep = (lambda wire: _twisted_sweep(spine, wire, self.twist, self.taper)) if shaped else \
+            (lambda wire: self._swept(spine, wire, rail, self.guide_mode))
+        solid = sweep(profile)
         if solid is None or not TopExp_Explorer(solid, TopAbs_SOLID).More():
             raise FeatureError("Beim Sweep entstand kein Volumen (Profil zu groß für die Kurven des Pfads?"
                                + (" Berührt das Profil am Anfang die Führungsschiene?)" if rail else ")"))
         # Löcher im Profil: jedes wird ebenfalls entlang des Pfads gezogen und herausgeschnitten
         for hole in holes:
-            core = self._swept(spine, hole, rail, self.guide_mode)
+            core = sweep(hole)
             if core is None:
                 raise FeatureError("Ein Loch im Profil ließ sich nicht entlang des Pfads ziehen")
             solid = ft._boolean(BRepAlgoAPI_Cut, solid, core)
@@ -426,28 +442,130 @@ class Sweep(Feature):
             raise FeatureError("Der Sweep ließ sich mit diesem Profil und Pfad nicht bilden") from error
 
 
+def _partial_wire(wire, fraction: float):
+    """Der Anfang eines Drahts bis zum Längenanteil `fraction` (Sweep „Abstand“): ganze Kanten, die letzte
+    gekürzt."""
+    from OCP.BRepTools import BRepTools_WireExplorer
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    total = GCPnts_AbscissaPoint.Length_s(BRepAdaptor_CompCurve(TopoDS.Wire(wire)))
+    wanted, used = total * fraction, 0.0
+    maker = BRepBuilderAPI_MakeWire()
+    explorer = BRepTools_WireExplorer(TopoDS.Wire(wire))
+    while explorer.More() and used < wanted - 1e-9:
+        edge = explorer.Current()
+        curve = BRepAdaptor_Curve(edge)
+        length = GCPnts_AbscissaPoint.Length_s(curve)
+        if used + length <= wanted + 1e-9:
+            maker.Add(edge)
+        else:
+            # die letzte Kante bis zur gewünschten Länge kürzen (in Laufrichtung des Drahts)
+            reverse = edge.Orientation() == TopAbs_REVERSED
+            first, last = curve.FirstParameter(), curve.LastParameter()
+            rest = wanted - used
+            if reverse:
+                cut = GCPnts_AbscissaPoint(curve, -rest, last).Parameter()
+                piece = BRepBuilderAPI_MakeEdge(BRep_Tool.Curve_s(edge, 0.0, 1.0), cut, last).Edge()
+                piece.Reverse()
+            else:
+                cut = GCPnts_AbscissaPoint(curve, rest, first).Parameter()
+                piece = BRepBuilderAPI_MakeEdge(BRep_Tool.Curve_s(edge, 0.0, 1.0), first, cut).Edge()
+            maker.Add(piece)
+        used += length
+        explorer.Next()
+    if not maker.IsDone():
+        raise FeatureError("Der Pfad ließ sich nicht kürzen")
+    return maker.Wire()
+
+
+def _twisted_sweep(spine, wire, twist: float, taper: float):
+    """Sweep mit Verdrehung und Verjüngung (Fusion: Verdrehungswinkel, Verjüngungswinkel): Kopien des Profils
+    entlang des Pfads, jede in einem verdrehungsarm mitgeführten Rahmen, um die Pfadrichtung gedreht und kleiner
+    skaliert, dann zu einem Körper verbunden. Das Profil muss am Pfadanfang quer zum Pfad liegen."""
+    from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+    curve = BRepAdaptor_CompCurve(TopoDS.Wire(spine))
+    length = GCPnts_AbscissaPoint.Length_s(curve)
+    if length < 1e-9:
+        raise FeatureError("Der Pfad hat keine Länge")
+    # Größe des Profils für die Verjüngung: halbe Diagonale seines Hüllquaders
+    box = Bnd_Box()
+    BRepBndLib.Add_s(wire, box)
+    half = math.sqrt(box.SquareExtent()) / 2 or 1.0
+    count = int(min(120, max(8, length / 2.0, abs(twist) / 10.0)))
+    first, last = curve.FirstParameter(), curve.LastParameter()
+
+    def frame_at(parameter):
+        point, tangent = gp_Pnt(), gp_Vec()
+        curve.D1(parameter, point, tangent)
+        return point, tangent.Normalized()
+
+    origin, tangent = frame_at(first)
+    helper = gp_Vec(0, 0, 1) if abs(tangent.Z()) < 0.9 else gp_Vec(1, 0, 0)
+    normal = (helper - tangent * helper.Dot(tangent)).Normalized()
+    start = gp_Ax3(origin, gp_Dir(tangent.XYZ()), gp_Dir(normal.XYZ()))
+    maker = BRepOffsetAPI_ThruSections(True, False)
+    for number in range(count + 1):
+        share = number / count
+        parameter = GCPnts_AbscissaPoint(curve, length * share, first).Parameter() if number < count else last
+        point, tangent = frame_at(parameter)
+        # Rahmen verdrehungsarm weiterführen: die bisherige Normale senkrecht zur neuen Tangente stellen
+        normal = (normal - tangent * normal.Dot(tangent))
+        if normal.Magnitude() < 1e-9:
+            normal = gp_Vec(start.XDirection().XYZ())
+        normal.Normalize()
+        place = gp_Trsf()
+        place.SetTransformation(gp_Ax3(point, gp_Dir(tangent.XYZ()), gp_Dir(normal.XYZ())), start)
+        turn = gp_Trsf()
+        turn.SetRotation(gp_Ax1(origin, start.Direction()), math.radians(twist * share))
+        scale = max(0.02, 1.0 - length * share * math.tan(math.radians(taper)) / half)
+        shrink = gp_Trsf()
+        shrink.SetScale(origin, scale)
+        moved = BRepBuilderAPI_Transform(wire, place.Multiplied(turn.Multiplied(shrink)), True).Shape()
+        maker.AddWire(TopoDS.Wire(moved))
+    maker.CheckCompatibility(False)
+    maker.Build()
+    if not maker.IsDone():
+        raise FeatureError("Der verdrehte bzw. verjüngte Sweep ließ sich nicht bilden")
+    return maker.Shape()
+
+
 @dataclass
 class Loft(Feature):
-    """Erhebung: verbindet die Profile von zwei oder drei Skizzen zu einem Körper.
+    """Erhebung: verbindet die Profile mehrerer Skizzen zu einem Körper.
 
-    Die Skizzen liegen üblicherweise auf versetzten Ebenen; verbunden wird in der
-    angegebenen Reihenfolge.
+    Die Skizzen liegen üblicherweise auf versetzten Ebenen; verbunden wird in der angegebenen Reihenfolge. Wie in
+    Fusion (Runde 93) beliebig viele Profile (`more` nach den ersten dreien), auf Wunsch geschlossen (vom letzten
+    Profil zurück zum ersten, z. B. ein Ring) und mit geraden statt weichen Übergängen.
     """
 
     sketch: str = ""
     sketch2: str = ""
     sketch3: str = NO_SKETCH
     operation: str = OPERATIONS[0]
+    more: list = field(default_factory=list)    # weitere Profilskizzen nach den ersten dreien
+    closed: bool = False                        # geschlossen: zurück zum ersten Profil
+    ruled: bool = False                         # gerade Übergänge zwischen den Profilen (sonst weich)
+    # Mittellinie wie Fusion (Runde 96): Skizze mit einer Kurve, entlang der die Profile ineinander übergehen
+    centerline: str = NO_SKETCH
 
     KIND = "Erhebung"
 
     def apply(self, state: BuildState) -> None:
-        names = [name for name in (self.sketch, self.sketch2, self.sketch3) if name and name != NO_SKETCH]
+        names = [name for name in (self.sketch, self.sketch2, self.sketch3, *self.more)
+                 if name and name != NO_SKETCH]
         if len(names) < 2 or len(set(names)) != len(names):
             raise FeatureError("Die Erhebung braucht mindestens zwei verschiedene Skizzen")
+        if self.closed and len(names) < 3:
+            raise FeatureError("Eine geschlossene Erhebung braucht mindestens drei Profile")
+        if self.centerline not in ("", NO_SKETCH):
+            if self.centerline in names:
+                raise FeatureError("Die Mittellinie braucht eine eigene Skizze")
+            ft._combine(state, self._along_centerline(state, names), self.operation)
+            return
         try:
-            maker = BRepOffsetAPI_ThruSections(True, False)     # Volumen, weiche Übergänge
-            for name in names:
+            maker = BRepOffsetAPI_ThruSections(True, self.ruled)    # Volumen; weich oder gerade Übergänge
+            for name in names + (names[:1] if self.closed else []):
                 maker.AddWire(_outline(state, name))
             maker.CheckCompatibility(True)
             maker.Build()
@@ -459,6 +577,24 @@ class Loft(Feature):
         if solid is None or not TopExp_Explorer(solid, TopAbs_SOLID).More():
             raise FeatureError("Bei der Erhebung entstand kein Volumen (liegen die Profile in einer Ebene?)")
         ft._combine(state, solid, self.operation)
+
+    def _along_centerline(self, state: BuildState, names: list):
+        return _loft_along(_path_wire(state, self.centerline), [_outline(state, name) for name in names])
+
+
+def _loft_along(spine, wires):
+    """Profile entlang einer Mittellinie verbinden (Profilzug des Kerns mit mehreren Querschnitten)."""
+    try:
+        pipe = BRepOffsetAPI_MakePipeShell(spine)
+        for wire in wires:
+            pipe.Add(wire, False, False)        # die Profile bleiben, wo sie gezeichnet sind
+        pipe.Build()
+        if pipe.IsDone() and pipe.MakeSolid():
+            return pipe.Shape()
+    except Exception:
+        pass
+    raise FeatureError("Die Erhebung ließ sich entlang dieser Mittellinie nicht bilden "
+                       "(liegen die Profile quer zur Linie und in ihrer Reihenfolge?)")
 
 
 HOLE_HEADS = ("Ohne Senkung", "Zylindersenkung", "Kegelsenkung")
@@ -488,6 +624,9 @@ class Hole(Feature):
 
     # neu angelegt ohne Fläche/Skizzenpunkte: wartet auf den Klick auf eine Fläche (nicht im Ursprung bohren)
     require_pick: bool = False
+    # Runde 96 wie Fusion: Bohrspitze eines Sacklochs – flach oder kegelig mit dem Spitzenwinkel des Bohrers
+    drill_point: str = "Flach"         # DRILL_POINTS
+    drill_angle: float = 118.0
 
     KIND = "Bohrung"
 
@@ -531,6 +670,17 @@ class Hole(Feature):
                 depth = 2 * reach
                 start = start.Translated(gp_Vec(axes.Direction().XYZ()) * reach)
         tool = BRepPrimAPI_MakeCylinder(gp_Ax2(start, into), diameter / 2, depth).Shape()
+        if self.drill_point not in DRILL_POINTS:
+            raise FeatureError(f"Unbekannte Bohrspitze '{self.drill_point}'")
+        if self.depth > 0 and self.drill_point == DRILL_POINTS[1]:
+            if not 30 <= self.drill_angle <= 180:
+                raise FeatureError("Der Spitzenwinkel liegt zwischen 30 und 180 Grad")
+            if self.drill_angle < 180:
+                # Kegel unten am Sackloch: Radius bis 0 über die Länge, die der Spitzenwinkel ergibt
+                tip = diameter / 2 / math.tan(math.radians(self.drill_angle / 2))
+                bottom = start.Translated(gp_Vec(into.XYZ()) * depth)
+                cone = BRepPrimAPI_MakeCone(gp_Ax2(bottom, into), diameter / 2, 0.0, tip).Shape()
+                tool = ft._boolean(BRepAlgoAPI_Fuse, tool, cone)
         ft._combine(state, tool, "Ausschneiden")
         if self.tapped != TAP_OPTIONS[0]:
             self._tap(state, start, into, diameter)
@@ -630,6 +780,11 @@ class MoveBody(Feature):
     angle_x: float = 0.0
     angle_y: float = 0.0
     angle_z: float = 0.0
+    # Runde 95 wie Fusion „Punkt zu Punkt“: der Körper wird so verschoben, dass `from_point` auf `to_point` liegt
+    # (beide im Modell angeklickt; Eckpunkt, Kreismitte oder Stelle auf einer Fläche) – zusätzlich zu x/y/z
+    move_type: str = "Frei"            # MOVE_TYPES
+    from_point: list = field(default_factory=list)
+    to_point: list = field(default_factory=list)
 
     KIND = "Verschieben"
 
@@ -662,7 +817,14 @@ class MoveBody(Feature):
                 turn.SetRotation(gp_Ax1(centre, gp_Dir(*AXES[axis])), math.radians(angle))
                 rotation = turn.Multiplied(rotation)        # die spätere Drehung wirkt auf das schon Gedrehte
         shift = gp_Trsf()
-        shift.SetTranslation(gp_Vec(self.move_x, self.move_y, self.move_z))
+        move = gp_Vec(self.move_x, self.move_y, self.move_z)
+        if self.move_type not in MOVE_TYPES:
+            raise FeatureError(f"Unbekannte Art '{self.move_type}'")
+        if self.move_type == MOVE_TYPES[1] and len(self.from_point) >= 3 and len(self.to_point) >= 3:
+            # Punkt zu Punkt: der (gedrehte/skalierte) Startpunkt soll auf dem Zielpunkt landen
+            start = gp_Pnt(*self.from_point[:3]).Transformed(rotation.Multiplied(scaling))
+            move = move + gp_Vec(start, gp_Pnt(*self.to_point[:3]))
+        shift.SetTranslation(move)
         return shift.Multiplied(rotation.Multiplied(scaling))
 
     def apply(self, state: BuildState) -> None:
@@ -680,6 +842,9 @@ class MoveBody(Feature):
                     chosen += [member for member in members if member in state.bodies and member not in chosen]
         for name in chosen:
             state.move_body(name, transform)        # gefärbte Flächen wandern mit
+
+
+MOVE_TYPES = ("Frei", "Punkt zu Punkt")       # Arten des Verschiebens (Fusion: Verschiebungsart)
 
 
 def bodies_centre(shapes: list) -> gp_Pnt:
@@ -752,16 +917,24 @@ class MirrorBody(Feature):
     operation: str = OPERATIONS[0]
     frame: list = field(default_factory=list)   # gewählte ebene Körperfläche als Spiegelebene (wie Teilen)
     base: str = ft.NO_BASE      # Konstruktionsebene als Spiegelebene
+    # wie Fusion (Runde 95): Körper oder Features spiegeln – bei Features wird ihre Wirkung (Bohrung, Rippe,
+    # Rundung …) gespiegelt am vorhandenen Körper wiederholt, angepasst neu berechnet oder als Kopie
+    object_type: str = "Körper"        # PATTERN_OBJECTS (steht weiter unten in dieser Datei)
+    source_feature: str = ""
+    compute: str = "Angepasst"         # PATTERN_COMPUTE
 
     KIND = "Spiegeln"
 
     def apply(self, state: BuildState) -> None:
-        if self.operation not in OPERATIONS[:2]:
-            raise FeatureError("Spiegeln erzeugt einen neuen Körper oder vereinigt mit dem Original")
         # wie Fusion: an einer Hauptebene, einer gewählten ebenen Körperfläche oder einer Konstruktionsebene
         axes = sketch.placed_axes(state, self.plane, self.offset, self.frame, self.base)
         mirror = gp_Trsf()
         mirror.SetMirror(gp_Ax2(axes.Location(), axes.Direction()))
+        if self.object_type == PATTERN_OBJECTS[1]:
+            _pattern(self, state, [mirror])
+            return
+        if self.operation not in OPERATIONS[:2]:
+            raise FeatureError("Spiegeln erzeugt einen neuen Körper oder vereinigt mit dem Original")
         names = ft.select_bodies(state, self.body)
         if self.operation != "Vereinigen":
             _check_body_count(state, len(names))
@@ -793,6 +966,26 @@ PATTERN_OBJECT_FIELDS = {"body": ("Körper",), "operation": ("Körper",), "sourc
 # Berechnung wie in Fusion: „Angepasst“ rechnet das Feature an jeder Stelle neu (es passt sich der Geometrie dort an,
 # z. B. „Bis Fläche“ oder eine Durchgangsbohrung bei anderer Wandstärke); „Identisch“ kopiert nur seine Wirkung
 PATTERN_COMPUTE = ("Angepasst", "Identisch")
+# Verteilung wie Fusion (Runde 95): Abstand je Exemplar oder Ausdehnung (Abstand gilt für das ganze Muster)
+PATTERN_DISTRIBUTIONS = ("Abstand", "Ausdehnung")
+
+
+def skipped_items(text: str) -> set[int]:
+    """Unterdrückte Exemplare (Fusion: Exemplare unterdrücken) aus einer Liste wie „3, 5-7“ (1 = Original)."""
+    found: set[int] = set()
+    for part in str(text).replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            if "-" in part:
+                low, high = (int(value) for value in part.split("-", 1))
+                found.update(range(min(low, high), max(low, high) + 1))
+            else:
+                found.add(int(part))
+        except ValueError:
+            raise FeatureError(f"„{part}“ ist keine Exemplarnummer (z. B. „3, 5-7“)") from None
+    return found
 
 
 def _pattern(feature, state: BuildState, transforms: list) -> None:
@@ -913,6 +1106,7 @@ class PathPattern(Feature):
     count: float = 5.0
     orientation: str = PATH_ORIENTATIONS[0]
     operation: str = OPERATIONS[0]
+    skip: str = ""                  # unterdrückte Exemplare, z. B. „3, 5“ (1 = Original am Pfadanfang, Runde 95)
 
     KIND = "Muster entlang Pfad"
 
@@ -938,6 +1132,7 @@ class PathPattern(Feature):
 
         origin, first_tangent = place(sampler.Parameter(1))
         transforms = []
+        skipped = skipped_items(self.skip)
         for number in range(2, sampler.NbPoints() + 1):
             point, tangent = place(sampler.Parameter(number))
             move = gp_Trsf()
@@ -949,7 +1144,10 @@ class PathPattern(Feature):
                     turn = gp_Trsf()
                     turn.SetRotation(gp_Ax1(point, gp_Dir(axis)), first_tangent.Angle(tangent))
                     move = turn.Multiplied(move)
-            transforms.append(move)
+            if number not in skipped:
+                transforms.append(move)
+        if not transforms:
+            raise FeatureError("Alle Exemplare sind unterdrückt")
         _pattern(self, state, transforms)
 
 
@@ -1102,7 +1300,9 @@ def _without_faces(body, faces):
     remover.SetShape(body)
     for face in faces:
         remover.AddFaceToRemove(face)
-    remover.SetRunParallel(True)
+    # im Probelauf-Kind seriell: dessen Arbeits-Threads gibt es nach dem Abspalten nicht, parallel verklemmte es
+    # sich (Runde 93: „Fläche verschieben“ hing beim Ziehen je Schritt bis zur 45-s-Grenze)
+    remover.SetRunParallel(not guard.in_child())
     try:
         remover.Build()
     except Exception:
@@ -1231,26 +1431,47 @@ class RectangularPattern(Feature):
     second_count: float = 1.0
     second_spacing: float = 20.0
     operation: str = OPERATIONS[0]
+    # --- seit Runde 95 (Fusion-Funktionen) ---
+    distribution: str = PATTERN_DISTRIBUTIONS[0]    # Abstand je Exemplar oder Ausdehnung des ganzen Musters
+    symmetric: bool = False         # erste Richtung nach beiden Seiten (wie Fusion „Symmetrisch“)
+    second_symmetric: bool = False
+    skip: str = ""                  # unterdrückte Exemplare, z. B. „3, 5-7“ (Nummern siehe Hinweis im Feld)
 
     KIND = "Rechteckiges Muster"
+
+    def _offsets(self, count: int, spacing: float, symmetric: bool) -> list[float]:
+        """Lagen der Exemplare längs einer Richtung (0 = Original)."""
+        if self.distribution not in PATTERN_DISTRIBUTIONS:
+            raise FeatureError(f"Unbekannte Verteilung '{self.distribution}'")
+        step = spacing / max(count - 1, 1) if self.distribution == PATTERN_DISTRIBUTIONS[1] else spacing
+        steps = range(-(count - 1), count) if symmetric else range(count)
+        return [k * step for k in steps]
 
     def apply(self, state: BuildState) -> None:
         first, second = int(round(self.count)), int(round(self.second_count))
         if first < 1 or second < 1 or first * second < 2:
             raise FeatureError("Das Muster braucht insgesamt mindestens zwei Exemplare")
-        if first * second > _PATTERN_LIMIT:
-            raise FeatureError(f"Das Muster ist auf {_PATTERN_LIMIT} Exemplare begrenzt")
         if self.axis not in AXES or self.second_axis not in AXES:
             raise FeatureError("Unbekannte Achse")
+        firsts = self._offsets(first, self.spacing, self.symmetric)
+        seconds = self._offsets(second, self.second_spacing, self.second_symmetric)
+        if len(firsts) * len(seconds) > _PATTERN_LIMIT:
+            raise FeatureError(f"Das Muster ist auf {_PATTERN_LIMIT} Exemplare begrenzt")
+        skipped = skipped_items(self.skip)
         transforms = []
-        for i in range(first):
-            for j in range(second):
-                if i == j == 0:
-                    continue    # das Original selbst
+        number = 1                      # Exemplarnummer: 1 ist das Original, dann zeilenweise
+        for a in firsts:
+            for b in seconds:
+                if abs(a) < 1e-12 and abs(b) < 1e-12:
+                    continue            # das Original selbst
+                number += 1
+                if number in skipped:
+                    continue            # unterdrücktes Exemplar
                 shift = gp_Trsf()
-                shift.SetTranslation(gp_Vec(*AXES[self.axis]) * (i * self.spacing)
-                                     + gp_Vec(*AXES[self.second_axis]) * (j * self.second_spacing))
+                shift.SetTranslation(gp_Vec(*AXES[self.axis]) * a + gp_Vec(*AXES[self.second_axis]) * b)
                 transforms.append(shift)
+        if not transforms:
+            raise FeatureError("Alle Exemplare sind unterdrückt")
         _pattern(self, state, transforms)
 
 
@@ -1270,6 +1491,9 @@ class CircularPattern(Feature):
     count: float = 6.0
     angle: float = 360.0
     operation: str = OPERATIONS[0]
+    # --- seit Runde 95 (Fusion-Funktionen) ---
+    symmetric: bool = False         # Winkel nach beiden Seiten vom Original (wie Fusion „Symmetrisch“)
+    skip: str = ""                  # unterdrückte Exemplare, z. B. „3, 5“ (1 = Original)
 
     KIND = "Kreisförmiges Muster"
 
@@ -1285,11 +1509,23 @@ class CircularPattern(Feature):
         point, direction = state.axes.get(self.axis, ((0.0, 0.0, 0.0), AXES.get(self.axis)))
         full = abs(abs(self.angle) - 360) < 1e-9
         step = self.angle / count if full else self.angle / (count - 1)
+        if self.symmetric and not full:
+            # symmetrisch: die Exemplare verteilen sich über den Winkel nach beiden Seiten des Originals
+            step = 2 * self.angle / (count - 1) if count > 1 else 0.0
+            angles = [(index - (count - 1) / 2) * step / 2 for index in range(count)]
+            angles = [value for value in angles if abs(value) > 1e-9]
+        else:
+            angles = [index * step for index in range(1, count)]
+        skipped = skipped_items(self.skip)
         transforms = []
-        for index in range(1, count):
+        for number, value in enumerate(angles, start=2):
+            if number in skipped:
+                continue
             rotation = gp_Trsf()
-            rotation.SetRotation(gp_Ax1(gp_Pnt(*point), gp_Dir(*direction)), math.radians(index * step))
+            rotation.SetRotation(gp_Ax1(gp_Pnt(*point), gp_Dir(*direction)), math.radians(value))
             transforms.append(rotation)
+        if not transforms:
+            raise FeatureError("Alle Exemplare sind unterdrückt")
         _pattern(self, state, transforms)
 
 
@@ -1363,6 +1599,9 @@ class Rib(Feature):
 
     sketch: str = ""
     thickness: float = 3.0
+    # Runde 96 wie Fusion: Lage der Dicke zur Skizzenebene und Tiefe (0 = bis zum Körper)
+    thickness_side: str = "Symmetrisch"        # RIB_SIDES
+    depth: float = 0.0
 
     KIND = "Rippe"
 
@@ -1371,6 +1610,10 @@ class Rib(Feature):
             raise FeatureError(f"Skizze '{self.sketch}' fehlt oder enthält keine Linien")
         if self.thickness <= 0:
             raise FeatureError("Die Dicke muss größer als 0 sein")
+        if self.thickness_side not in RIB_SIDES:
+            raise FeatureError(f"Unbekannte Lage der Dicke '{self.thickness_side}'")
+        if self.depth < 0:
+            raise FeatureError("Die Tiefe darf nicht negativ sein (0 = bis zum Körper)")
         if not state.bodies:
             raise FeatureError("Für eine Rippe fehlt ein Körper, an den sie anschließt")
         normal = gp_Vec(state.frames[self.sketch].Direction().XYZ())
@@ -1401,26 +1644,37 @@ class Rib(Feature):
         best = None
         for sign in (1.0, -1.0):
             # Fläche in der Skizzenebene, um die halbe Dicke zurückgesetzt und dann aufgedickt
-            sheet = BRepPrimAPI_MakePrism(edge, across * (sign * reach)).Shape()
+            sheet = BRepPrimAPI_MakePrism(edge, across * (sign * (self.depth or reach))).Shape()
             back = gp_Trsf()
-            back.SetTranslation(normal * (-self.thickness / 2))
+            # Dicke symmetrisch zur Skizzenebene, ganz auf der Normalenseite oder ganz auf der anderen
+            shift = {"Symmetrisch": -self.thickness / 2, "Seite 1": 0.0, "Seite 2": -self.thickness}
+            back.SetTranslation(normal * shift[self.thickness_side])
             sheet = BRepBuilderAPI_Transform(sheet, back, True).Shape()
             slab = BRepPrimAPI_MakePrism(sheet, normal * self.thickness).Shape()
             pieces = ft._boolean(BRepAlgoAPI_Cut, slab, body)
-            probe = middle.Translated(across * (sign * 1e-3))
+            # Prüfpunkt mitten in der Wanddicke (bei „Seite 1/2“ liegt die Skizzenebene auf dem Rand der Wand)
+            probe = middle.Translated(across * (sign * 1e-3) + normal * (shift[self.thickness_side]
+                                                                       + self.thickness / 2))
             pieces_explorer = TopExp_Explorer(pieces, TopAbs_SOLID)
             while pieces_explorer.More():
                 piece = pieces_explorer.Current()
                 pieces_explorer.Next()
                 if BRepClass3d_SolidClassifier(piece, probe, 1e-7).State() != TopAbs_IN:
                     continue
-                # Reicht das Stück an der Linie bis ans Ende der Wand, ist auf dieser Seite kein Körper
+                # Reicht das Stück an der Linie bis ans Ende der Wand, ist auf dieser Seite kein Körper. Mit
+                # fester Tiefe: die Seite, auf der der Körper etwas weggenommen hat (dort schließt die Rippe an)
                 volume = _volume(piece)
-                if volume < 0.5 * _volume(slab) and (best is None or volume < best[0]):
+                limit = _volume(slab) * (1.0 - 1e-6) if self.depth else 0.5 * _volume(slab)
+                if volume < limit and (best is None or volume < best[0]):
                     best = (volume, piece)
         if best is None:
             raise FeatureError("Die Rippe trifft den Körper nicht – die Linie muss zum Körper hin offen sein")
         return best[1]
+
+
+RIB_SIDES = ("Symmetrisch", "Seite 1", "Seite 2")
+DRILL_POINTS = ("Flach", "Spitz")
+THREAD_HANDS = ("Rechts", "Links")     # Gewinderichtung      # Bohrspitze eines Sacklochs (wie Fusion „Bohrspitze“)     # Lage der Rippendicke zur Skizzenebene (wie Fusion)
 
 
 @dataclass
@@ -1736,7 +1990,10 @@ def interferences(state: BuildState, names: list[str] | None = None) -> list[tup
 SPLIT_KEEP = ("Beide Teile", "Nur die Seite in Pfeilrichtung", "Nur die Gegenseite")
 REVOLVE_EXTENTS = ("Eine Seite", "Symmetrisch", "Zwei Seiten")    # wie Fusions Drehen
 SCALE_REFERENCES = ("Körpermitte", "Ursprung")
-DRAFT_NEUTRAL = ("Unten (Fuß bleibt)", "Oben (Kopf bleibt)")
+DRAFT_NEUTRAL = ("Unten (Fuß bleibt)", "Oben (Kopf bleibt)", "Mitte")
+# Seiten der Schräge wie Fusion (Runde 96): eine Seite, symmetrisch oder zwei Seiten mit eigenem Winkel – bei zwei
+# Seiten werden die Wände an der neutralen Ebene geteilt und neigen sich von ihr weg (Trennebene eines Gussteils)
+DRAFT_SIDES = ("Eine Seite", "Symmetrisch", "Zwei Seiten")
 
 
 @dataclass
@@ -2215,11 +2472,17 @@ class Draft(Feature):
     face_points: list = field(default_factory=list)     # Merkpunkte der gewählten Flächen
 
     require_pick: bool = False  # neu angelegt: erst mit gewählten Flächen wirksam
+    sides: str = "Eine Seite"   # DRAFT_SIDES
+    angle2: float = 3.0         # Winkel der zweiten Seite (nur „Zwei Seiten“)
 
     KIND = "Schräge"
 
     def parameters(self) -> list:
         return [item for item in super().parameters() if item.name != "require_pick"]
+
+    def _two_sided(self, body, faces, pull, neutral, height, index):
+        """Symmetrisch bzw. zwei Seiten: Wände an der neutralen Ebene teilen, jede Hälfte von ihr weg neigen."""
+        return _draft_two_sided(self, body, faces, pull, neutral, height, index)
 
     def apply(self, state: BuildState) -> None:
         if self.require_pick and not self.face_points:
@@ -2228,6 +2491,10 @@ class Draft(Feature):
             raise FeatureError("Achse oder neutrale Ebene unbekannt")
         if not 0 < abs(self.angle) < 60:
             raise FeatureError("Der Winkel muss zwischen 0 und 60 Grad liegen")
+        if self.sides not in DRAFT_SIDES:
+            raise FeatureError(f"Unbekannte Seitenwahl '{self.sides}'")
+        if self.sides == DRAFT_SIDES[2] and not 0 < abs(self.angle2) < 60:
+            raise FeatureError("Der zweite Winkel muss zwischen 0 und 60 Grad liegen")
         pull = gp_Dir(*AXES[self.axis])
         index = "XYZ".index(self.axis)
         names = ft.select_bodies(state, self.body)
@@ -2236,7 +2503,8 @@ class Draft(Feature):
         for name in names:
             body = state.bodies[name]
             bounds = _bounds(body)
-            height = bounds[index] if self.neutral == DRAFT_NEUTRAL[0] else bounds[index + 3]
+            height = bounds[index] if self.neutral == DRAFT_NEUTRAL[0] else bounds[index + 3] \
+                if self.neutral == DRAFT_NEUTRAL[1] else (bounds[index] + bounds[index + 3]) / 2
             origin = [0.0, 0.0, 0.0]
             origin[index] = height
             neutral = gp_Pln(gp_Pnt(*origin), pull)
@@ -2246,6 +2514,9 @@ class Draft(Feature):
                 faces = [face for face in ft.faces_of(body) if _stands_along(face, pull)]
             if not faces:
                 raise FeatureError("Es gibt keine Fläche, die sich in dieser Richtung neigen lässt")
+            if self.sides != DRAFT_SIDES[0]:
+                state.bodies[name] = self._two_sided(body, faces, pull, neutral, height, index)
+                continue
             # Die Flächen kippen um ihre Schnittlinie mit der neutralen Ebene: mit dem Fuß als
             # neutraler Ebene wird der Kopf schmaler, mit dem Kopf der Fuß breiter
             angle = math.radians(self.angle)
@@ -2282,6 +2553,57 @@ class Draft(Feature):
                 if result is None:
                     raise FeatureError("Keine der Seitenwände lässt sich neigen (z. B. wegen angrenzender Rundungen)")
             state.bodies[name] = result
+
+
+def _draft_two_sided(feature, body, faces, pull: gp_Dir, neutral: gp_Pln, height: float, index: int):
+    """Schräge nach beiden Seiten der neutralen Ebene (Trennebene, wie Fusion „Symmetrisch“/„Zwei Seiten“).
+
+    Der Körper wird an der Ebene in zwei Teile geschnitten; jeder Teil wird wie eine einseitige Schräge mit der
+    neutralen Ebene als Fuß geneigt (oben in Entformungsrichtung, unten in Gegenrichtung) und danach wieder
+    vereinigt. Die Wände nur zu teilen genügt nicht: beide Hälften behalten dieselbe geometrische Ebene, die der
+    Kern einmal kippt – die obere Hälfte lief dann einfach mit (Runde 96)."""
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
+    planes = [BRepAdaptor_Surface(TopoDS.Face(face)).Plane() for face in faces
+              if BRepAdaptor_Surface(TopoDS.Face(face)).GetType() == GeomAbs_Plane]
+    if not planes:
+        raise FeatureError("Die zweiseitige Schräge geht nur an ebenen Wänden")
+    plane_face = BRepBuilderAPI_MakeFace(neutral, -1e5, 1e5, -1e5, 1e5).Face()
+    location = neutral.Location()
+    up = gp_Vec(pull.XYZ())
+    second = feature.angle if feature.sides == DRAFT_SIDES[1] else feature.angle2
+    parts = []
+    for side, direction, angle in ((1.0, pull, feature.angle), (-1.0, pull.Reversed(), second)):
+        inside = BRepPrimAPI_MakeHalfSpace(plane_face, location.Translated(up * side)).Solid()
+        part = ft._boolean(BRepAlgoAPI_Common, body, inside)
+        if part is None or part.IsNull() or not TopExp_Explorer(part, TopAbs_SOLID).More():
+            continue                        # die Ebene liegt am Rand: auf dieser Seite gibt es nichts
+        maker = BRepOffsetAPI_DraftAngle(part)
+        added = 0
+        for face in ft.faces_of(part):
+            surface = BRepAdaptor_Surface(TopoDS.Face(face))
+            if surface.GetType() != GeomAbs_Plane:
+                continue
+            own = surface.Plane()
+            if not any(own.Axis().IsParallel(other.Axis(), 1e-6) and other.Distance(own.Location()) < 1e-6
+                       for other in planes):
+                continue
+            maker.Add(TopoDS.Face(face), direction, math.radians(angle), neutral)
+            if not maker.AddDone():
+                raise FeatureError("Die Schräge ließ sich mit diesem Winkel nicht bilden")
+            added += 1
+        if added:
+            maker.Build()
+            if not maker.IsDone():
+                raise FeatureError("Die zweiseitige Schräge ließ sich nicht bilden")
+            part = maker.Shape()
+        parts.append(part)
+    if not parts:
+        raise FeatureError("Die neutrale Ebene schneidet den Körper nicht")
+    result = parts[0] if len(parts) == 1 else ft._boolean(BRepAlgoAPI_Fuse, parts[0], parts[1])
+    result = ft.unified(result)
+    if not BRepCheck_Analyzer(result).IsValid():
+        raise FeatureError("Die zweiseitige Schräge ergab keinen gültigen Körper")
+    return result
 
 
 def _stands_along(face, direction: gp_Dir) -> bool:
@@ -2355,6 +2677,7 @@ class Thread(Feature):
     length: float = 0.0
     face_points: list = field(default_factory=list)     # Merkpunkt der gewählten Zylinderfläche
     size: str = THREAD_SIZES[0]     # Normgröße; sie legt die Steigung fest, wenn keine eigene eingetragen ist
+    hand: str = "Rechts"            # Gewinderichtung wie Fusion: Rechts- oder Linksgewinde (THREAD_HANDS, Runde 96)
 
     KIND = "Gewinde"
 
@@ -2396,8 +2719,20 @@ class Thread(Feature):
         cut.SetArguments(targets)
         # endet das Gewinde vor dem Ende der Fläche, läuft die Rille dort aus
         fades = 0 < self.length < high - low
-        cut.SetTools(_thread_groove(cylinder.Position(), radius, pitch, depth, start, end, inside, fades))
-        cut.SetRunParallel(True)        # viele kleine Stücke: parallel deutlich schneller
+        if self.hand not in THREAD_HANDS:
+            raise FeatureError(f"Unbekannte Gewinderichtung '{self.hand}'")
+        groove = _thread_groove(cylinder.Position(), radius, pitch, depth, start, end, inside, fades)
+        if self.hand == THREAD_HANDS[1]:
+            # Linksgewinde: das Spiegelbild der Rechtsrille an einer Ebene durch die Achse
+            position = cylinder.Position()
+            mirror = gp_Trsf()
+            mirror.SetMirror(gp_Ax2(position.Location(), position.XDirection()))
+            mirrored = List_TopoDS_Shape()
+            for piece in groove:
+                mirrored.Append(BRepBuilderAPI_Transform(piece, mirror, True).Shape())
+            groove = mirrored
+        cut.SetTools(groove)
+        cut.SetRunParallel(not guard.in_child())    # parallel deutlich schneller, im Probelauf-Kind seriell
         cut.Build()
         result = cut.Shape() if cut.IsDone() else None
         # Der Schnitt muss Material abgetragen haben, ohne den Körper zu zerstören

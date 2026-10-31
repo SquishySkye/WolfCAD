@@ -1757,7 +1757,13 @@ class Sketch(Feature):
                 for face in ft.faces_of(state.profiles[name]):
                     builder.Add(faces, face)
         for entry in self.texts:
-            letters = text_shape(axes, *entry)     # Text, Lage, Höhe, Drehung und ggf. die Schrift
+            if len(entry) == 7 and entry[6] >= 0:
+                # Text am Pfad: Buchstabe für Buchstabe entlang eines Elements der Skizze
+                if entry[6] >= len(self.entities):
+                    raise FeatureError("Der Pfad des Textes ist nicht mehr in der Skizze")
+                letters = text_on_path(axes, entry, _edge(axes, self.entities[entry[6]]))
+            else:
+                letters = text_shape(axes, *entry[:6])  # Text, Lage, Höhe, Drehung und ggf. die Schrift
             state.sketch_curves.append(letters)
             state.sketch_parts.setdefault(self.name, []).append(letters)
             for face in ft.faces_of(letters):
@@ -1845,9 +1851,12 @@ else:
 
 def check_text(entry: list) -> str | None:
     """Fehlermeldung, wenn der Texteintrag unbrauchbar ist, sonst None."""
-    if (len(entry) not in (5, 6) or not isinstance(entry[0], str) or not entry[0].strip()
+    # 5 Werte (Text, x, y, Höhe, Drehung), dazu wahlweise die Schrift und (Runde 96) die Nummer des Elements, an dem
+    # der Text entlangläuft (Text am Pfad; x ist dann der Abstand vom Anfang des Elements, y der Abstand zum Pfad)
+    if (len(entry) not in (5, 6, 7) or not isinstance(entry[0], str) or not entry[0].strip()
             or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in entry[1:5])
-            or (len(entry) == 6 and not isinstance(entry[5], str))):
+            or (len(entry) >= 6 and not isinstance(entry[5], str))
+            or (len(entry) == 7 and not isinstance(entry[6], int))):
         return f"Unbrauchbarer Texteintrag {entry!r}"
     return None if entry[3] > 0 else "Text: die Schrifthöhe muss größer als 0 sein"
 
@@ -1894,6 +1903,65 @@ def text_shape(axes: gp_Ax2, text: str, x: float, y: float, height: float, rotat
     if shape is None or shape.IsNull() or not TopExp_Explorer(shape, TopAbs_FACE).More():
         raise FeatureError(f"Der Text '{text}' ergibt keine Flächen")
     return shape
+
+
+def text_on_path(axes: gp_Ax2, entry: list, edge):
+    """Text am Pfad (Fusion: Text an Pfad, Runde 96): jeder Buchstabe sitzt auf der Kurve, an der Stelle seines
+    Abstands vom Anfang (entry[1] + bisherige Breite) und um ihre Richtung dort gedreht; entry[2] hebt die Grundlinie
+    quer zur Kurve an."""
+    from OCP.BRepAdaptor import BRepAdaptor_Curve
+    from OCP.GCPnts import GCPnts_AbscissaPoint
+    text, offset, lift, height = entry[0], float(entry[1]), float(entry[2]), float(entry[3])
+    font_name = entry[5] if len(entry) > 5 else ""
+    curve = BRepAdaptor_Curve(edge)
+    length = GCPnts_AbscissaPoint.Length_s(curve)
+    normal = gp_Vec(axes.Direction().XYZ())
+    # lesbar wie in Fusion: die Oberkante der Buchstaben zeigt von der Krümmungsmitte weg (Text außen auf einem
+    # Bogen, von links nach rechts) – sonst läuft der Text andersherum über die Kurve
+    point, first_d, second_d = gp_Pnt(), gp_Vec(), gp_Vec()
+    curve.D2((curve.FirstParameter() + curve.LastParameter()) / 2, point, first_d, second_d)
+    up_middle = normal.Crossed(first_d)
+    backwards = second_d.Magnitude() > 1e-12 and up_middle.Dot(second_d) > 0
+    if not backwards and second_d.Magnitude() <= 1e-12:
+        # gerade: von links nach rechts in der Skizze (x-Richtung der Ebene), bei senkrechter Linie von unten
+        along = first_d.Dot(gp_Vec(axes.XDirection().XYZ()))
+        backwards = along < -1e-9 or (abs(along) <= 1e-9 and first_d.Dot(gp_Vec(axes.YDirection().XYZ())) < 0)
+    builder, letters = BRep_Builder(), TopoDS_Compound()
+    builder.MakeCompound(letters)
+    position = offset
+    with _quiet_stderr():
+        font = StdPrs_BRepFont.FindAndCreate_s(TCollection_AsciiString(font_name or TEXT_FONT),
+                                               Font_FontAspect.Font_FontAspect_Regular, height)
+    for character in text:
+        width = _letter_width(character, height, font_name)
+        if character.strip() and 0.0 <= position + width / 2 <= length:
+            distance = position + width / 2
+            parameter = GCPnts_AbscissaPoint(curve, length - distance if backwards else distance,
+                                             curve.FirstParameter()).Parameter()
+            middle, tangent = gp_Pnt(), gp_Vec()
+            curve.D1(parameter, middle, tangent)
+            tangent.Normalize()
+            if backwards:
+                tangent.Reverse()
+            up = normal.Crossed(tangent)            # quer zur Kurve in der Skizzenebene
+            start = middle.Translated(tangent * (-width / 2) + up * lift)
+            place = gp_Ax3(start, axes.Direction(), gp_Dir(tangent.XYZ()))
+            shape = StdPrs_BRepTextBuilder().Perform(font, NCollection_String(character), place)
+            if shape is not None and not shape.IsNull():
+                builder.Add(letters, shape)
+        position += width + height * 0.08
+    if not TopExp_Explorer(letters, TopAbs_FACE).More():
+        raise FeatureError(f"Der Text '{text}' passt nicht auf den Pfad (zu lang oder Abstand zu groß)")
+    return letters
+
+
+def _letter_width(character: str, height: float, font_name: str) -> float:
+    """Breite eines Buchstabens (aus seinem Umriss; Leerzeichen ein Drittel der Schrifthöhe)."""
+    if not character.strip():
+        return height * 0.33
+    lines = text_outline(character, height, font_name)
+    xs = [x for line in lines for x, _y in line]
+    return (max(xs) - min(xs)) if xs else height * 0.5
 
 
 _text_outlines: dict[tuple, list] = {}

@@ -13,6 +13,7 @@ from __future__ import annotations
 def _table() -> dict:
     """Werkzeugart (KIND) -> {Feld: Startwert}; erst beim Aufruf gebaut (vermeidet Ringimporte)."""
     from . import extras as ex
+    from . import gears as gr
     from . import features as ft
     from . import meshes as ms
     from . import more_tools as mt
@@ -39,8 +40,9 @@ def _table() -> dict:
         solids.ScaleBody: {"factor": 1.0, "factor_y": 0.0, "factor_z": 0.0},     # 0 = wie der Faktor
         sk.ConstructionPlane: {"offset": 0.0, "tilt": 0.0},
         ex.SplitFace: {"offset": 0.0},
-        ex.Torus: {"diameter": 0.0},
+        ex.Torus: {"diameter": 0.0, "section": 0.0},     # Querschnitt 0 = automatisch (Torus.tube)
         ex.Coil: {"turns": 0.0},
+        gr.Gear: {"thickness": 0.0},     # Runde 97: Zahnrad wächst am Pfeil in die Breite
         ex.Pipe: {"diameter": 0.0},
         ex.Hem: {"length": 0.0},
         mt.Emboss: {"depth": 0.0},
@@ -87,6 +89,14 @@ def is_neutral(feature) -> bool:
         return False            # an einer Hauptebene oder mit Trennfläche teilt schon der Startwert
     if feature.KIND == "Extrusion" and getattr(feature, "extent", None) not in _distance_extents():
         return False            # „bis Fläche“/„durch alles“ brauchen keine Länge
+    if feature.KIND == "Verrundung" and getattr(feature, "fillet_type", "") == "Volle Rundung":
+        return False            # der Radius folgt aus den Seitenflächen; die Mittelfläche reicht schon
+    if feature.KIND in ("Verrundung", "Fase") and any(float(entry.get("radius", entry.get("distance", 0.0))) > 0
+                                                      for entry in getattr(feature, "sets", [])):
+        return False            # abgeschlossene Auswahlsätze wirken, auch wenn der neue Satz noch bei 0 steht
+    if feature.KIND == "Verschieben" and getattr(feature, "move_type", "") == "Punkt zu Punkt" \
+            and getattr(feature, "from_point", None) and getattr(feature, "to_point", None):
+        return False            # Punkt zu Punkt: die beiden angeklickten Punkte sind schon die Bewegung
     if feature.KIND == "Verschieben" and getattr(feature, "copy", False):
         return False            # Kopie an Ort und Stelle ist schon eine Wirkung
     return all(abs(float(getattr(feature, name, value)) - float(value)) < 1e-12 for name, value in values.items())

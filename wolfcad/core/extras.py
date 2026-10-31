@@ -52,12 +52,72 @@ class Torus(Feature):
 
     KIND = "Torus"
 
+    def tube(self) -> float:
+        """Wirksamer Querschnitt: 0 heißt „automatisch ein Viertel des Rings“ (Runde 93). So zeigt schon der erste
+        Zug am Ring (Start bei 0) einen Torus, der Querschnitt lässt sich danach am zweiten Pfeil einstellen."""
+        return self.section if self.section > 0 else self.diameter / 4
+
     def apply(self, state: BuildState) -> None:
-        if self.section <= 0 or self.diameter <= self.section:
+        section = self.tube()
+        if self.diameter <= section or section <= 0:
             raise FeatureError("Der Ringdurchmesser muss größer als der Querschnitt sein")
         frame = _frame(self.plane, self.center_x, self.center_y, self.center_z)
-        solid = BRepPrimAPI_MakeTorus(frame, self.diameter / 2, self.section / 2).Shape()
+        solid = BRepPrimAPI_MakeTorus(frame, self.diameter / 2, section / 2).Shape()
         ft._combine(state, solid, self.operation)
+
+
+# Querschnitte von Spule und Rohr wie Fusion (Runde 96); Dreieck außen/innen: Spitze zeigt von der Achse weg bzw. hin
+SECTIONS = ("Kreis", "Quadrat", "Dreieck (außen)", "Dreieck (innen)")
+PIPE_SECTIONS = ("Kreis", "Quadrat", "Dreieck")
+SECTION_PLACES = ("Mitte", "Innen", "Außen")     # Lage des Spulenquerschnitts zum Windungsdurchmesser
+COIL_TYPES = ("Windungen und Steigung", "Windungen und Höhe", "Höhe und Steigung", "Spirale")
+COIL_FIELDS = {"turns": COIL_TYPES[:2] + COIL_TYPES[3:], "pitch": (COIL_TYPES[0], COIL_TYPES[2], COIL_TYPES[3]),
+               "height": COIL_TYPES[1:3]}
+
+
+def section_wire(kind: str, centre: gp_Pnt, normal: gp_Dir, radial: gp_Dir, size: float):
+    """Geschlossener Querschnitt der Größe `size` (Durchmesser bzw. Kantenlänge) um `centre`, in der Ebene
+    senkrecht zu `normal`; `radial` gibt die Richtung „nach außen“ an (für Quadrat und Dreieck)."""
+    from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon
+    if kind == "Kreis":
+        return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(gp_Circ(gp_Ax2(centre, normal), size / 2)).Edge()).Wire()
+    u = gp_Vec(radial.XYZ())
+    u = u - gp_Vec(normal.XYZ()) * u.Dot(gp_Vec(normal.XYZ()))
+    if u.Magnitude() < 1e-9:
+        u = gp_Vec(gp_Ax2(centre, normal).XDirection().XYZ())
+    u.Normalize()
+    v = gp_Vec(normal.XYZ()).Crossed(u)
+    at = lambda a, b: centre.Translated(u * a + v * b)
+    half = size / 2
+    if kind == "Quadrat":
+        corners = [at(-half, -half), at(half, -half), at(half, half), at(-half, half)]
+    elif kind in ("Dreieck", "Dreieck (außen)", "Dreieck (innen)"):
+        # gleichseitiges Dreieck mit Kantenlänge `size`, Schwerpunkt in der Mitte, Spitze nach außen bzw. innen
+        sign = -1.0 if kind == "Dreieck (innen)" else 1.0
+        high = size * math.sqrt(3) / 2
+        corners = [at(sign * 2 * high / 3, 0.0), at(-sign * high / 3, half), at(-sign * high / 3, -half)]
+    else:
+        raise FeatureError(f"Unbekannter Querschnitt '{kind}'")
+    polygon = BRepBuilderAPI_MakePolygon()
+    for corner in corners:
+        polygon.Add(corner)
+    polygon.Close()
+    return polygon.Wire()
+
+
+def spiral_wire(frame: gp_Ax2, radius: float, pitch: float, turns: float):
+    """Flache Spirale (Fusion: Spule „Spirale“): beginnt beim Radius und wächst je Windung um die Steigung."""
+    from OCP.GeomAPI import GeomAPI_PointsToBSpline
+    from OCP.OCP.collections import Array1_gp_Pnt as TColgp_Array1OfPnt
+    count = max(16, int(turns * 48))
+    points = TColgp_Array1OfPnt(1, count + 1)
+    origin, x_dir, y_dir = frame.Location(), gp_Vec(frame.XDirection().XYZ()), gp_Vec(frame.YDirection().XYZ())
+    for number in range(count + 1):
+        angle = 2 * math.pi * turns * number / count
+        r = radius + pitch * angle / (2 * math.pi)
+        points.SetValue(number + 1, origin.Translated(x_dir * (r * math.cos(angle)) + y_dir * (r * math.sin(angle))))
+    curve = GeomAPI_PointsToBSpline(points, 3, 8).Curve()
+    return BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(curve).Edge()).Wire()
 
 
 def helix_wire(frame: gp_Ax2, radius: float, pitch: float, turns: float):
@@ -85,23 +145,48 @@ class Coil(Feature):
     turns: float = 5.0
     section: float = 3.0            # Drahtdurchmesser
     operation: str = OPERATIONS[0]
+    # --- seit Runde 96 (Fusion-Funktionen) ---
+    coil_type: str = COIL_TYPES[0]
+    height: float = 40.0            # Höhe der Spule (bei „… und Höhe“ / „Höhe und Steigung“)
+    section_type: str = SECTIONS[0]
+    section_place: str = SECTION_PLACES[0]
 
     KIND = "Spule"
 
+    def geometry(self) -> tuple[float, float]:
+        """(Steigung, Windungen) nach der Art der Spule."""
+        if self.coil_type not in COIL_TYPES:
+            raise FeatureError(f"Unbekannte Art '{self.coil_type}'")
+        if self.coil_type == COIL_TYPES[1]:
+            if self.turns <= 0:
+                raise FeatureError("Mindestens ein Stück Windung")
+            return self.height / self.turns, self.turns
+        if self.coil_type == COIL_TYPES[2]:
+            if self.pitch <= 0:
+                raise FeatureError("Die Steigung muss größer als 0 sein")
+            return self.pitch, self.height / self.pitch
+        return self.pitch, self.turns
+
     def apply(self, state: BuildState) -> None:
         from OCP.BRepOffsetAPI import BRepOffsetAPI_MakePipeShell
-        if self.section <= 0 or self.diameter <= self.section or self.turns <= 0:
+        pitch, turns = self.geometry()
+        if self.section <= 0 or self.diameter <= self.section or turns <= 0:
             raise FeatureError("Windungsdurchmesser > Drahtdurchmesser > 0 und mindestens ein Stück Windung")
-        if self.pitch <= self.section:
+        if pitch <= self.section:
             raise FeatureError("Die Steigung muss größer als der Drahtdurchmesser sein (sonst berühren sich die Windungen)")
+        if self.section_type not in SECTIONS or self.section_place not in SECTION_PLACES:
+            raise FeatureError("Unbekannter Querschnitt bzw. unbekannte Lage")
         frame = _frame(self.plane, self.center_x, self.center_y, self.center_z)
-        radius = self.diameter / 2
-        spine = helix_wire(frame, radius, self.pitch, self.turns)
-        # Querschnitt am Anfang der Schraubenlinie, senkrecht zu ihrer Richtung
+        # Lage des Querschnitts: mittig auf dem Windungsdurchmesser, ganz innerhalb oder ganz außerhalb
+        radius = self.diameter / 2 + {"Mitte": 0.0, "Innen": -self.section / 2, "Außen": self.section / 2}[
+            self.section_place]
+        spiral = self.coil_type == COIL_TYPES[3]
+        spine = spiral_wire(frame, radius, pitch, turns) if spiral else helix_wire(frame, radius, pitch, turns)
+        # Querschnitt am Anfang der Kurve, senkrecht zu ihrer Richtung
         start = gp_Pnt(frame.Location().XYZ() + gp_Vec(frame.XDirection()).XYZ() * radius)
-        tangent = gp_Vec(frame.YDirection()) * (2 * math.pi * radius) + gp_Vec(frame.Direction()) * self.pitch
-        circle = gp_Circ(gp_Ax2(start, gp_Dir(tangent)), self.section / 2)
-        profile = BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circle).Edge()).Wire()
+        tangent = gp_Vec(frame.YDirection()) * (2 * math.pi * radius) + \
+            (gp_Vec(frame.XDirection()) * pitch if spiral else gp_Vec(frame.Direction()) * pitch)
+        profile = section_wire(self.section_type, start, gp_Dir(tangent), frame.XDirection(), self.section)
         pipe = BRepOffsetAPI_MakePipeShell(spine)
         pipe.SetMode(frame.Direction())         # feste Bezugsrichtung: der Querschnitt verdreht sich nicht
         pipe.Add(profile)
@@ -119,6 +204,7 @@ class Pipe(Feature):
     diameter: float = 10.0
     wall: float = 0.0               # 0 = voll
     operation: str = OPERATIONS[0]
+    section_type: str = PIPE_SECTIONS[0]        # Querschnitt wie Fusion: Kreis, Quadrat oder Dreieck (Runde 96)
 
     KIND = "Rohr"
 
@@ -130,17 +216,21 @@ class Pipe(Feature):
         from .solids import _path_wire
         if self.diameter <= 0 or self.wall < 0 or 2 * self.wall >= self.diameter:
             raise FeatureError("Durchmesser > 0 und Wandstärke kleiner als der halbe Durchmesser")
+        if self.section_type not in PIPE_SECTIONS:
+            raise FeatureError(f"Unbekannter Querschnitt '{self.section_type}'")
         spine = _path_wire(state, self.path)
         curve = BRepAdaptor_CompCurve(spine)
         start, tangent = gp_Pnt(), gp_Vec()
         curve.D1(curve.FirstParameter(), start, tangent)
 
+        across = gp_Ax2(start, gp_Dir(tangent)).XDirection()
+
         def swept(radius: float):
-            circle = gp_Circ(gp_Ax2(start, gp_Dir(tangent)), radius)
             pipe = BRepOffsetAPI_MakePipeShell(spine)
             # an Knicken des Pfads treffen sich die Stücke auf Gehrung (sonst endet das Rohr am ersten Knick)
             pipe.SetTransitionMode(BRepBuilderAPI_RightCorner)
-            pipe.Add(BRepBuilderAPI_MakeWire(BRepBuilderAPI_MakeEdge(circle).Edge()).Wire())
+            # Größe: Durchmesser beim Kreis, Kantenlänge bei Quadrat und Dreieck
+            pipe.Add(section_wire(self.section_type, start, gp_Dir(tangent), across, 2 * radius))
             pipe.Build()
             if not pipe.IsDone() or not pipe.MakeSolid():
                 raise FeatureError("Das Rohr ließ sich entlang dieses Pfads nicht bilden (zu enge Kurve?)")

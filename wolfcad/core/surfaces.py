@@ -160,6 +160,28 @@ class OffsetSurface(Feature):
         state.add_surface(maker.Shape())
 
 
+def thicken_sheet(shape, thickness: float):
+    """Flächenkörper `shape` um `thickness` aufdicken (negativ: zur anderen Seite) – wie „Aufdicken“, auch für die
+    dünne Extrusion offener Linien (Runde 96)."""
+    sewing = BRepBuilderAPI_Sewing(1e-4)
+    sewing.Add(shape)
+    sewing.Perform()
+    maker = BRepOffset_MakeOffset()
+    maker.Initialize(sewing.SewedShape(), thickness, 1e-6, BRepOffset_Skin, False, False, GeomAbs_Intersection, True)
+    try:
+        maker.MakeOffsetShape()
+    except Exception as error:
+        raise FeatureError("Die Fläche ließ sich nicht aufdicken") from error
+    if not maker.IsDone():
+        raise FeatureError("Die Fläche ließ sich nicht aufdicken")
+    solid = maker.Shape()
+    if abs(_volume(solid)) <= 1e-9:
+        raise FeatureError("Die Fläche ließ sich nicht aufdicken")
+    if _volume(solid) < 0:
+        solid.Reverse()         # nach innen gekehrt: umdrehen, sonst rechnen spätere Verknüpfungen falsch
+    return solid
+
+
 @dataclass
 class Thicken(Feature):
     """Aufdicken: aus dem Flächenkörper wird ein Volumenkörper der angegebenen Dicke (negativ: zur anderen Seite);

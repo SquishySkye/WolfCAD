@@ -64,7 +64,8 @@ def export(shapes: list, path: str | Path, deflection: float = 0.05, colours: li
         # Eine schon vorhandene Zerlegung (von der Anzeige) würde sonst unverändert übernommen
         BRepTools.Clean_s(compound)
         # Auch der zulässige Knickwinkel folgt der Feinheit, sonst blieben runde Flächen gleich fein
-        BRepMesh_IncrementalMesh(compound, deflection, False, min(0.8, 0.15 + deflection * 2.5), True)
+        from . import guard     # im Probelauf-Kind seriell zerlegen (dort fehlen die Arbeits-Threads)
+        BRepMesh_IncrementalMesh(compound, deflection, False, min(0.8, 0.15 + deflection * 2.5), not guard.in_child())
         writer = StlAPI_Writer()
         writer.ASCIIMode = False                # binär: deutlich kleinere Dateien
         done = bool(writer.Write(compound, str(path)))

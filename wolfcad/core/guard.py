@@ -14,6 +14,7 @@ import os
 import pickle
 import select
 import signal
+import sys
 import time
 
 OK, CRASH, TIMEOUT, ERROR = "ok", "crash", "timeout", "error"
@@ -49,14 +50,42 @@ def run(work, seconds: float = DEFAULT_SECONDS, want_result: bool = False) -> tu
         global _IN_CHILD
         _IN_CHILD = True
         code = 0
+        # Ein Absturz des Kinds ist erwartet und wird gemeldet: kein Speicherabbild (das System schrieb bei großem
+        # Programm je Absturz ~1,5 s lang einen Core-Dump) und kein Eintrag im Fehlerprotokoll des Programms
+        # (faulthandler des Elternprozesses), Runde 93
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        except (ImportError, ValueError, OSError):
+            pass
+        import faulthandler
+        faulthandler.disable()
+        debug = os.environ.get("WOLFCAD_GUARD_DEBUG")
+        mark = (lambda text: os.write(os.open(debug, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o644),
+                                      f"{os.getpid()} {time.monotonic():.3f} {text}\n".encode())) if debug and debug != "1" else (lambda text: None)
+        mark("abgespalten")
+        if debug == "1":
+            # Fehlersuche: kurz vor der Zeitgrenze zeigt das Kind, wo es steht (Hänger finden)
+            import faulthandler
+            faulthandler.dump_traceback_later(max(seconds - 5.0, 1.0), exit=False, file=sys.stderr, repeat=False)
         try:
             os.close(read_end)
             try:
+                mark("rechnet")
+                if os.environ.get("WOLFCAD_GUARD_TRACE"):
+                    # Fehlersuche: jeden Aufruf (auch in C) mitschreiben, die letzte Zeile zeigt einen Hänger
+                    def trace(frame, event, arg):
+                        if event in ("call", "c_call"):
+                            name = getattr(arg, "__qualname__", "") if event == "c_call" else frame.f_code.co_qualname
+                            mark(f"{event} {frame.f_code.co_filename.rsplit('/', 1)[-1]}:{frame.f_lineno} {name}")
+                    sys.setprofile(trace)
                 answer = (OK, work() if want_result else (work(), None)[1])
+                mark("fertig")
             except BaseException as error:      # gewöhnlicher Fehler: der Elternprozess meldet ihn selbst
                 answer = (ERROR, str(error))
             with os.fdopen(write_end, "wb") as out:
                 pickle.dump(answer, out)
+            mark("gemeldet")
         except BaseException:
             code = 3
         finally:

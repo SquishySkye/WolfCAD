@@ -22,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
-from PySide6.QtCore import QObject, QProcess, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QObject, QProcess, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox,
@@ -33,7 +33,9 @@ from PySide6.QtWidgets import (
 
 from ..core import meshes
 from ..printing import catalog, gcode, moonraker, plate, profiles, slicer
+from . import handles as hd
 from .icons import icon
+from .navbar import NavigationBar
 from .viewport import GL_LINES, GL_TRIANGLES, Viewport, _Layer
 
 WORK_ROOT = Path(tempfile.gettempdir()) / "wolfcad-druck"     # Arbeitsordner für Modelle, Profile und G-Code
@@ -79,6 +81,7 @@ class PrintView(Viewport):
     painted = Signal(int, object)           # Objekt, Treffpunkt des Pinsels (beim Malen)
     paint_finished = Signal()
     lay_requested = Signal(object)          # Außennormale der angeklickten Auflagefläche („Auf Fläche legen“)
+    key_command = Signal(str)               # Taste in der Ansicht: "orbit", "play", "left", "right", "up", "down"
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -94,7 +97,11 @@ class PrintView(Viewport):
         }
         for kind, (_label, colour) in gcode.FEATURES.items():
             extra["gc_" + kind] = _Layer(GL_LINES, colour, False, line_width=1.4)
+            # Runde 92: dieselben Bahnen als beleuchtete Stränge (Darstellung „als Körper“ wie im Original)
+            extra["gs_" + kind] = _Layer(GL_TRIANGLES, colour, True)
         extra["gc_current"] = _Layer(GL_LINES, (1.0, 1.0, 1.0), False, line_width=1.8)
+        # Düse an der Stelle, bis zu der der Ablauf gerade zeigt (über allem gezeichnet)
+        extra["gc_nozzle"] = _Layer(GL_LINES, (1.0, 1.0, 1.0), False, line_width=3.0, on_top=True)
         # Bemalung: Stützen erzwingen (grün) / blockieren (rot), Farben je Filament (Palette des Reiters)
         extra["paint_enforce"] = _Layer(GL_TRIANGLES, (0.25, 0.85, 0.35), True)
         extra["paint_block"] = _Layer(GL_TRIANGLES, (0.95, 0.30, 0.30), True)
@@ -111,6 +118,7 @@ class PrintView(Viewport):
         extra_lay["lay_faces"].alpha, extra_lay["lay_hover"].alpha = 0.35, 0.75
         self._layers.update(extra_lay)
         self._painting = False
+        self._solid_cache: tuple | None = None     # (Bahnen, {Art: Stränge}) – einmal je G-Code gerechnet
         self._objects: list[np.ndarray] = []
         self._dragging: int | None = None
         self._drag_offset = (0.0, 0.0)
@@ -137,7 +145,13 @@ class PrintView(Viewport):
         for (ax, ay), (bx, by) in zip(corners, corners[1:] + corners[:1]):
             volume += [[ax, ay, height], [bx, by, height], [ax, ay, 0], [ax, ay, height]]
         self.set_geometry("bed_volume", np.array(volume, float))
-        self.fit(np.array([[0, 0, 0], [width, depth, height * 0.4]], float))
+        # Kamera nur bei neuer Bettgröße einpassen (Runde 97): die Druckersuche im Hintergrund meldet den Drucker
+        # oft erst Sekunden nach dem Öffnen – die Ansicht sprang dann mitten im Verschieben auf die Gesamtansicht
+        # – und nie, während gerade ein Objekt oder Pfeil gezogen wird (der Griff säße danach nicht mehr unter der Maus)
+        busy = self._handle_drag or getattr(self, "_dragging", None) is not None
+        if getattr(self, "_bed_size", None) != (width, depth, height) and not busy:
+            self._bed_size = (width, depth, height)
+            self.fit(np.array([[0, 0, 0], [width, depth, height * 0.4]], float))
 
     def set_objects(self, placed: list[np.ndarray], selected: int, outside: list[bool], visible: bool = True) -> None:
         """Objekte zeichnen: gewähltes blau, außerhalb des Bauraums rot."""
@@ -202,24 +216,77 @@ class PrintView(Viewport):
                 best, best_distance = index, distance
         return (best, eye + best_distance * direction) if best >= 0 else (-1, None)
 
-    def set_toolpath(self, path: gcode.Toolpath | None, upto: int, kinds: set[str], travel: bool) -> None:
-        """Bahnen bis zur Schicht `upto` (einschließlich); die oberste Schicht hell hervorgehoben."""
+    # Ab so vielen Strecken zeigt die Körperdarstellung nur die obersten Schichten als Stränge, darunter Linien
+    # (je Strecke 18 Eckpunkte; ein sehr großer Druck bräuchte sonst Hunderte MB Grafikspeicher)
+    SOLID_LIMIT = 2_500_000
+    SOLID_TOP_LAYERS = 60
+
+    def set_toolpath(self, path: gcode.Toolpath | None, upto: int, kinds: set[str], travel: bool,
+                     limit: int | None = None, solid: bool = True) -> None:
+        """Bahnen bis zur Schicht `upto`; mit `limit` nur bis zu dieser laufenden Nummer (Ablauf innerhalb der
+        Schicht wie im Original). `solid`: als Stränge mit Breite und Höhe statt als Linien (Runde 92).
+
+        Strecken liegen je Art in Druckreihenfolge vor; was bis zu einer Nummer gedruckt ist, ist deshalb ein
+        Anfangsstück der Felder – angezeigt wird ein Ausschnitt ohne Kopieren und Maskieren."""
+        if path is not None and limit is None:
+            # ohne Angabe: die ganze Schicht `upto` (ohne Schichtgrenzen, z. B. von Hand gebaut: alles)
+            limit = int(path.layer_last[min(upto, len(path.layer_last) - 1)]) if len(path.layer_last) \
+                else np.iinfo(np.int64).max
+        strands = self._strands(path) if path is not None and solid else {}
+        many = path is not None and sum(len(v) for v in path.segments.values()) > self.SOLID_LIMIT
+        nozzle, newest = None, -1
         for kind in gcode.FEATURES:
-            data = np.zeros((0, 3))
+            lines = solids_data = np.zeros((0, 3), np.float32)
             if path is not None and kind in path.segments and kind in kinds:
-                mask = path.layers[kind] <= upto
-                data = path.segments[kind][mask].reshape(-1, 3)
-            self.set_geometry("gc_" + kind, data)
+                count = int(np.searchsorted(path.orders[kind], limit, side="right"))
+                first = 0
+                if solid:
+                    # bei sehr großen Drucken: Stränge nur für die obersten Schichten
+                    if many:
+                        first = int(np.searchsorted(path.layers[kind], upto - self.SOLID_TOP_LAYERS, side="left"))
+                    solids_data = strands[kind][first:count].reshape(-1, 3)
+                lines = path.segments[kind][:first if solid else count].reshape(-1, 3)
+                if count and path.orders[kind][count - 1] > newest:
+                    newest, nozzle = int(path.orders[kind][count - 1]), path.segments[kind][count - 1][1]
+            self.set_geometry("gc_" + kind, lines)
+            self.set_geometry("gs_" + kind, solids_data)
         travel_data = np.zeros((0, 3))
         if path is not None and travel and len(path.travel):
-            travel_data = path.travel[path.travel_layers == upto].reshape(-1, 3)
+            picked = (path.travel_layers == upto) & (path.travel_orders <= limit)
+            travel_data = path.travel[picked].reshape(-1, 3)
         self.set_geometry("gc_travel", travel_data)
         current = []
-        if path is not None:
+        if path is not None and not solid:
             for kind in kinds:
                 if kind in path.segments and kind == "Outer wall":
                     current.append(path.segments[kind][path.layers[kind] == upto].reshape(-1, 3))
         self.set_geometry("gc_current", np.concatenate(current) if current else np.zeros((0, 3)))
+        self.set_geometry("gc_nozzle", self._nozzle(nozzle) if nozzle is not None else np.zeros((0, 3)))
+
+    def _strands(self, path: gcode.Toolpath) -> dict:
+        """Stränge je Art (gcode.solid_triangles), einmal je G-Code berechnet und gemerkt."""
+        if self._solid_cache is None or self._solid_cache[0] is not path:
+            strands = {}
+            for kind, segments in path.segments.items():
+                thickness = np.array([path.thickness(layer) for layer in range(path.layer_count)] or [0.2],
+                                     np.float32)[np.minimum(path.layers[kind], max(path.layer_count - 1, 0))]
+                strands[kind] = gcode.solid_triangles(segments, path.widths[kind], thickness)
+            self._solid_cache = (path, strands)
+        return self._solid_cache[1]
+
+    @staticmethod
+    def _nozzle(point) -> np.ndarray:
+        """Düsenmarke: kleiner Kegel aus Linien mit der Spitze an `point` (wie die Düse im Original)."""
+        x, y, z = (float(c) for c in point)
+        lines = []
+        for angle in np.linspace(0, 2 * np.pi, 9)[:-1]:
+            rim = [x + 1.6 * np.cos(angle), y + 1.6 * np.sin(angle), z + 3.0]
+            lines += [[x, y, z], rim]
+        ring = [[x + 1.6 * np.cos(a), y + 1.6 * np.sin(a), z + 3.0] for a in np.linspace(0, 2 * np.pi, 17)]
+        for a, b in zip(ring, ring[1:]):
+            lines += [a, b]
+        lines += [[x, y, z + 3.0], [x, y, z + 9.0]]
+        return np.array(lines, np.float32)
 
     # --- Objekte anklicken und ziehen ---------------------------------------------------------------------
 
@@ -262,6 +329,11 @@ class PrintView(Viewport):
                 self._painting = True
                 self.painted.emit(index, point)
                 return
+        if event.button() == Qt.MouseButton.LeftButton and self._handle_under(event.position()) is not None:
+            # Ziehpfeil bzw. Drehgriff am gewählten Objekt (Runde 97): das übernimmt die Ansicht wie in der
+            # Konstruktion (Wert am Pfeil, Wertfeld zum Eintippen)
+            super().mousePressEvent(event)
+            return
         if event.button() == Qt.MouseButton.LeftButton and not self._orbiting(event.buttons(), event.modifiers()):
             x, y = event.position().x(), event.position().y()
             index, height = self._object_at(x, y)
@@ -278,6 +350,28 @@ class PrintView(Viewport):
                     self._drag_offset = (centre[0] - point[0], centre[1] - point[1])
                     return
         super().mousePressEvent(event)
+
+    # Tasten der Druckansicht (Runde 92): O schaltet das Drehen mit der linken Maustaste, Leertaste spielt den
+    # Ablauf ab, Pfeiltasten gehen eine Bahn bzw. eine Schicht weiter
+    _KEYS = {Qt.Key.Key_O: "orbit", Qt.Key.Key_Space: "play", Qt.Key.Key_Left: "left", Qt.Key.Key_Right: "right",
+             Qt.Key.Key_Up: "up", Qt.Key.Key_Down: "down"}
+
+    def event(self, event) -> bool:
+        # Das Hauptfenster belegt Buchstaben fensterweit (O = Versatz beim Skizzieren); in der Druckansicht
+        # gehören diese Tasten der Ansicht: vorrangig beanspruchen, dann kommt keyPressEvent an
+        if event.type() == QEvent.Type.ShortcutOverride and Qt.Key(event.key()) in self._KEYS \
+                and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
+            event.accept()
+            return True
+        return super().event(event)
+
+    def keyPressEvent(self, event) -> None:
+        command = self._KEYS.get(Qt.Key(event.key()))
+        if command and not event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier:
+            self.key_command.emit(command)
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         if self.lay_faces and not event.buttons():
@@ -308,6 +402,10 @@ class PrintView(Viewport):
             self.drag_finished.emit()
             return
         super().mouseReleaseEvent(event)
+
+
+# Bettachsen für das Verschiebe-Kreuz
+_AXIS = {"X": (1.0, 0.0, 0.0), "Y": (0.0, 1.0, 0.0), "Z": (0.0, 0.0, 1.0)}
 
 
 def _ray_hits_box(origin, direction, low, high) -> bool:
@@ -561,16 +659,24 @@ class PrintWorkspace(QWidget):
         self.plate = plate.Plate()
         self.plates = [self.plate]          # wie im Original mehrere Druckplatten; gerechnet wird die gezeigte
         self.selected = -1
+        # Verschiebe-Kreuz (Runde 97): Ausgangslage des Objekts beim Setzen der Pfeile (Objekt, x, y, Drehung, Mitte)
+        # und die bisher gezogenen Werte je Griff; die Pfeile zählen ab dieser Lage
+        self._gizmo_start: tuple | None = None
+        self._gizmo_values: dict[str, float] = {}
         self._calibration = None            # laufender Kalibrierdruck (Nachbearbeitung des G-Codes)
         self.toolpath: gcode.Toolpath | None = None
         self.gcode_path: Path | None = None
         self._process: QProcess | None = None
         self._job: slicer.Job | None = None
         self._pool = ThreadPoolExecutor(max_workers=1)
+        # Hochladen mit eigenem Faden (Runde 96): sonst wartete es hinter der Druckersuche im Netz, die beim Öffnen
+        # des Reiters läuft (im Test bis zu 5 s, bevor das erste Byte ging)
+        self._upload_pool = ThreadPoolExecutor(max_workers=1)
         self._relay = _Relay()
         self._status_future = None
         self.slots: list[str] = []          # Filamentprofil je CFS-Fach
         self._build()
+        self.setAcceptDrops(True)           # Modelldateien hereinziehen
         self._load_profiles()
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(STATUS_SECONDS * 1000)
@@ -581,7 +687,7 @@ class PrintWorkspace(QWidget):
         elif self.library.available:
             # noch kein Drucker bekannt: im Hintergrund suchen (wie das Original beim ersten Start) und den
             # gefundenen samt passendem Profil übernehmen
-            future = self._pool.submit(moonraker.discover)
+            future = self._discovery = self._pool.submit(moonraker.discover)
             future.add_done_callback(lambda result: self._relay.later(lambda: self._discovered(result)))
 
     # --- Aufbau -------------------------------------------------------------------------------------------
@@ -756,13 +862,74 @@ class PrintWorkspace(QWidget):
         self.view.drag_finished.connect(self._refresh_objects)
         self.view.painted.connect(self._paint_at)
         self.view.paint_finished.connect(self._refresh_objects)
+        # Verschiebe-Kreuz am gewählten Objekt (Runde 97): Pfeile X/Y verschieben, Ringe X/Y/Z drehen
+        self.view.handle_changed.connect(self._gizmo_changed)
+        self.view.handle_released.connect(self._gizmo_released)
         row.addWidget(self.view, 1)
+        # Navigationsleiste wie in der Konstruktion (Runde 92): Drehen, Schwenken, Zoomen, Einpassen – die linke
+        # Maustaste dreht im Orbit-Modus die Ansicht (sonst verschiebt sie Objekte). Taste O schaltet das Drehen.
+        self.navbar = NavigationBar(self.view)
+        for key in ("look_at", "style", "grid", "filter"):
+            self.navbar.buttons[key].hide()
+        self.navbar.mode_changed.connect(lambda mode: setattr(self.view, "left_mode", mode))
+        self.navbar.fit_requested.connect(
+            lambda: self.view.set_bed(self.plate.width, self.plate.depth, self.plate.height))
+        self.navbar.adjustSize()
+        self.navbar.place()
         self.layer_slider = QSlider(Qt.Orientation.Vertical)
         self.layer_slider.setRange(0, 0)
         self.layer_slider.valueChanged.connect(self._layer_moved)
-        self.layer_slider.setVisible(False)
-        row.addWidget(self.layer_slider)
+        self.layer_label = QLabel("")
+        self.layer_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Schichtnummer und Regler in einem eigenen Element, das als Ganzes ein- und ausgeblendet wird: ein
+        # verschachteltes Layout mit nur versteckten Teilen begrenzte die Höhe der ganzen Zeile auf 300 px – die
+        # Druckansicht war nur noch ein schmaler Streifen (Nutzermeldung Runde 93)
+        self.layer_box = QWidget()
+        layers = QVBoxLayout(self.layer_box)
+        layers.setContentsMargins(0, 0, 0, 0)
+        layers.addWidget(self.layer_label)
+        layers.addWidget(self.layer_slider, 1)
+        self.layer_box.setVisible(False)
+        row.addWidget(self.layer_box)
         layout.addLayout(row, 1)
+        # Ablauf innerhalb der Schicht wie im Original (Runde 92): waagrechter Regler über die Bahnen der Schicht,
+        # Abspielen läuft Bahn für Bahn und Schicht für Schicht nach oben
+        self.moves = QWidget()
+        moves = QHBoxLayout(self.moves)
+        moves.setContentsMargins(0, 0, 0, 0)
+        self.play_button = QToolButton()
+        self.play_button.setIcon(icon("play"))
+        self.play_button.setCheckable(True)
+        self.play_button.setToolTip("Druckablauf abspielen (Leertaste) – Bahn für Bahn, Schicht für Schicht")
+        self.play_button.toggled.connect(self._play_toggled)
+        moves.addWidget(self.play_button)
+        back = QToolButton()
+        back.setText("◀")
+        back.setToolTip("Eine Bahn zurück (Pfeil links)")
+        back.clicked.connect(lambda: self.move_slider.setValue(self.move_slider.value() - 1))
+        forward = QToolButton()
+        forward.setText("▶")
+        forward.setToolTip("Eine Bahn weiter (Pfeil rechts)")
+        forward.clicked.connect(lambda: self.move_slider.setValue(self.move_slider.value() + 1))
+        moves.addWidget(back)
+        moves.addWidget(forward)
+        self.move_slider = QSlider(Qt.Orientation.Horizontal)
+        self.move_slider.setRange(0, 0)
+        self.move_slider.valueChanged.connect(self._move_moved)
+        moves.addWidget(self.move_slider, 1)
+        self.speed_box = QComboBox()
+        self.speed_box.addItems(["Langsam", "Normal", "Schnell", "Sehr schnell"])
+        self.speed_box.setCurrentIndex(1)
+        self.speed_box.setToolTip("Tempo des Abspielens")
+        moves.addWidget(self.speed_box)
+        self.move_label = QLabel("")
+        moves.addWidget(self.move_label)
+        self.moves.setVisible(False)
+        layout.addWidget(self.moves)
+        self._play_timer = QTimer(self)
+        self._play_timer.setInterval(30)
+        self._play_timer.timeout.connect(self._play_step)
+        self.view.key_command.connect(self._view_key)
         self.legend = QWidget()
         legend_layout = QHBoxLayout(self.legend)
         legend_layout.setContentsMargins(0, 0, 0, 0)
@@ -778,6 +945,13 @@ class PrintWorkspace(QWidget):
         self.travel_box = QCheckBox("Fahrwege")
         self.travel_box.toggled.connect(self._show_toolpath)
         legend_layout.addWidget(self.travel_box)
+        # wie im Original standardmäßig als Körper (Stränge mit Bahnbreite und Schichthöhe), abschaltbar auf Linien
+        self.solid_box = QCheckBox("Als Körper")
+        self.solid_box.setChecked(_settings().value("vorschau_koerper", "ja") != "nein")
+        self.solid_box.setToolTip("Bahnen als Stränge mit Breite und Schichthöhe zeigen (aus: dünne Linien)")
+        self.solid_box.toggled.connect(lambda on: (_settings().setValue("vorschau_koerper", "ja" if on else "nein"),
+                                                   self._show_toolpath()))
+        legend_layout.addWidget(self.solid_box)
         legend_layout.addStretch(1)
         self.legend.setVisible(False)
         layout.addWidget(self.legend)
@@ -959,9 +1133,41 @@ class PrintWorkspace(QWidget):
         self._refresh_objects()
 
     def _add_file(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Modell hinzufügen", str(Path.home()), "Netze (*.stl)")
-        if path:
-            self.add_meshes([(Path(path).stem, meshes.read_stl(path))])
+        """Modelle hinzufügen – mehrere Dateien auf einmal (Runde 97), auch OBJ, 3MF (alle Objekte) und STEP."""
+        paths, _ = QFileDialog.getOpenFileNames(self, "Modelle hinzufügen", str(Path.home()), meshes.MESH_FILE_FILTER)
+        self.add_files(paths)
+
+    # Dateien aus dem Dateimanager auf den Reiter ziehen (Runde 97): wie „Modelle hinzufügen“, beliebig viele
+    _DROP_SUFFIXES = (".stl", ".obj", ".3mf", ".step", ".stp")
+
+    def _dropped_paths(self, event) -> list[str]:
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        return [url.toLocalFile() for url in urls
+                if url.isLocalFile() and url.toLocalFile().lower().endswith(self._DROP_SUFFIXES)]
+
+    def dragEnterEvent(self, event) -> None:
+        if self._dropped_paths(event):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        paths = self._dropped_paths(event)
+        if paths:
+            event.acceptProposedAction()
+            self.add_files(paths)
+
+    def add_files(self, paths: list[str]) -> None:
+        """Lädt die Objekte aller Dateien und legt sie gemeinsam auf die gezeigte Platte (dann einmal anordnen)."""
+        found, problems = [], []
+        for path in paths:
+            try:
+                found += meshes.read_mesh_file(path)
+            except (meshes.FeatureError, OSError) as error:
+                problems.append(f"{Path(path).name}: {error}")
+        if found:
+            self.add_meshes(found)
+            self.info.setText(f"{len(found)} Objekt(e) aus {len(paths) - len(problems)} Datei(en) hinzugefügt.")
+        if problems:
+            QMessageBox.warning(self, "Modelle hinzufügen", "Nicht gelesen:\n" + "\n".join(problems))
 
     def _current(self) -> plate.PlateObject | None:
         return self.plate.objects[self.selected] if 0 <= self.selected < len(self.plate.objects) else None
@@ -1014,6 +1220,7 @@ class PrintWorkspace(QWidget):
                               "(orange = unter der Maus). Esc beendet.")
         else:
             self.view.set_lay_faces(None)
+        self._show_gizmo()                  # das Kreuz ruht, solange Flächen angeklickt werden
 
     def _show_lay_candidates(self) -> None:
         item = self._current()
@@ -1086,6 +1293,7 @@ class PrintWorkspace(QWidget):
     def _dragged(self, index: int, x: float, y: float) -> None:
         item = self.plate.objects[index]
         item.x, item.y = x, y
+        self._gizmo_start = None            # das Kreuz wandert mit dem Objekt
         self._invalidate()
         self._draw_objects()
 
@@ -1118,6 +1326,7 @@ class PrintWorkspace(QWidget):
         else:
             self.size_label.setText("–")
         self._filling = False
+        self._gizmo_start = None            # nach jeder Änderung zählen die Pfeile ab der neuen Lage
         self._draw_objects()
 
     def _draw_objects(self) -> None:
@@ -1127,6 +1336,70 @@ class PrintWorkspace(QWidget):
         self.view.set_objects(placed, self.selected, outside, visible=visible)
         self.view.set_paint([(triangles, item.support_paint, item.color_paint)
                              for triangles, item in zip(placed, self.plate.objects)], visible)
+        self._show_gizmo()
+
+    # --- Verschiebe-Kreuz (Runde 97) ----------------------------------------------------------------------------
+
+    def _show_gizmo(self) -> None:
+        """Pfeile am gewählten Objekt wie beim Verschieben in der Konstruktion: X (rot) und Y (grün) verschieben auf
+        dem Bett, die drei Ringe drehen um die Bettachsen durch die Objektmitte (danach liegt es wieder auf dem
+        Bett). Ausgeblendet in der Vorschau, beim Malen und bei „Auf Fläche legen“."""
+        if not hasattr(self, "preview_button"):
+            return                          # noch im Aufbau des Reiters
+        item = self._current()
+        if item is None or self.preview_button.isChecked() or self.view.paint_mode or self.view.lay_faces:
+            self._gizmo_start = None
+            self.view.set_handles([])
+            return
+        if self._gizmo_start is None or self._gizmo_start[0] is not item:
+            points = item.placed().reshape(-1, 3)
+            centre = tuple(float(c) for c in (points.min(0) + points.max(0)) / 2)
+            self._gizmo_start = (item, item.x, item.y, item.rotation.copy(), centre)
+            self._gizmo_values = {}
+        centre, values = self._gizmo_start[4], self._gizmo_values
+        at = (centre[0] + values.get("move_x", 0.0), centre[1] + values.get("move_y", 0.0), centre[2])
+        found = []
+        for axis in "XY":
+            parameter = f"move_{axis.lower()}"
+            direction, value = _AXIS[axis], values.get(parameter, 0.0)
+            # Fußpunkt so, dass die Spitze an der verschobenen Mitte sitzt: das Kreuz wandert mit
+            base = tuple(at[i] - direction[i] * value for i in range(3))
+            found.append(hd.Handle(base, direction, parameter, value, color=hd._AXIS_COLORS[axis],
+                                   lead=hd._MOVE_LEAD, gizmo=True))
+        for axis in "XYZ":
+            between = hd._unit(hd._RING_BETWEEN[axis])
+            towards = tuple(at[i] + between[i] * 1e-3 for i in range(3))
+            ring = hd.angle_handle(at, _AXIS[axis], towards, f"turn_{axis.lower()}",
+                                   values.get(f"turn_{axis.lower()}", 0.0), minimum=-360.0,
+                                   color=hd._AXIS_COLORS[axis], lead=hd._RING_LEAD)
+            ring.gizmo = True
+            found.append(ring)
+        self.view.set_handles(found, follow=False)
+
+    def _gizmo_changed(self, value: float) -> None:
+        """Ein Pfeil bzw. Ring wurde gezogen oder sein Wert eingetippt: Lage ab der Ausgangslage neu setzen."""
+        handle = self.view.active_handle()
+        if handle is None or self._gizmo_start is None:
+            return
+        item, start_x, start_y, start_rotation, _centre = self._gizmo_start
+        self._gizmo_values[handle.parameter] = float(value)
+        values = self._gizmo_values
+        item.x, item.y = start_x + values.get("move_x", 0.0), start_y + values.get("move_y", 0.0)
+        item.rotation = start_rotation.copy()
+        for axis in "XYZ":
+            angle = values.get(f"turn_{axis.lower()}", 0.0)
+            if angle:
+                item.rotate(axis, angle)
+        self._invalidate()
+        if self.view._handle_drag:
+            self._draw_objects()            # beim Ziehen nur zeichnen; Liste und Felder folgen beim Loslassen
+        else:
+            self._gizmo_released()          # eingetippter Wert: gleich übernehmen
+
+    def _gizmo_released(self) -> None:
+        """Pfeil losgelassen: Felder und Liste nachziehen, die Pfeile zählen ab der neuen Lage wieder bei 0."""
+        if self._gizmo_start is not None:
+            self._refresh_objects()
 
     def _invalidate(self) -> None:
         """Etwas am Bett hat sich geändert: der alte G-Code gilt nicht mehr."""
@@ -1290,6 +1563,7 @@ class PrintWorkspace(QWidget):
             self.paint_value.addItem("Radieren", 0)
         self.paint_value.setVisible(mode is not None)
         self.brush.setVisible(mode is not None)
+        self._show_gizmo()                  # beim Malen gehört die linke Maustaste dem Pinsel
         if mode is not None:
             self._set_mode(False)
             self.info.setText("Malen: mit gedrückter linker Taste über das Objekt streichen (Ansicht drehen wie "
@@ -1333,7 +1607,10 @@ class PrintWorkspace(QWidget):
             self.info.setText("Für die Vorschau zuerst „Slicen“.")
         self.prepare_button.setChecked(not preview)
         self.preview_button.setChecked(preview)
-        self.layer_slider.setVisible(preview)
+        self.layer_box.setVisible(preview)
+        self.moves.setVisible(preview)
+        if not preview:
+            self.play_button.setChecked(False)
         self.legend.setVisible(preview)
         self._draw_objects()
         if preview:
@@ -1342,16 +1619,82 @@ class PrintWorkspace(QWidget):
             self.view.set_toolpath(None, 0, set(), False)
 
     def _layer_moved(self, value: int) -> None:
-        self._show_toolpath()
+        """Neue Schicht: der Ablauf-Regler umfasst ihre Bahnen und steht am Ende (die ganze Schicht gedruckt)."""
         if self.toolpath is not None and self.toolpath.layer_count:
-            height = self.toolpath.layer_heights[min(value, self.toolpath.layer_count - 1)]
-            self.layer_slider.setToolTip(f"Schicht {value + 1} von {self.toolpath.layer_count} – {height:.2f} mm")
+            layer = min(value, self.toolpath.layer_count - 1)
+            height = self.toolpath.layer_heights[layer]
+            text = f"Schicht {value + 1} von {self.toolpath.layer_count} – {height:.2f} mm"
+            self.layer_slider.setToolTip(text)
+            self.layer_label.setText(f"{value + 1}\n{height:.2f}")
+            first, last = int(self.toolpath.layer_first[layer]), int(self.toolpath.layer_last[layer])
+            self.move_slider.blockSignals(True)
+            self.move_slider.setRange(first, max(first, last))
+            if not getattr(self, "_playing_layer_start", False):
+                self.move_slider.setValue(max(first, last))
+            self.move_slider.blockSignals(False)
+        self._show_toolpath()
+
+    def _view_key(self, command: str) -> None:
+        """Tasten der Druckansicht; Ablauf und Schichten nur in der Vorschau."""
+        if command == "orbit":
+            self.navbar.buttons["orbit"].toggle()
+            return
+        if not self.preview_button.isChecked():
+            return
+        if command == "play":
+            self.play_button.toggle()
+        elif command in ("left", "right"):
+            self.move_slider.setValue(self.move_slider.value() + (1 if command == "right" else -1))
+        else:
+            self.layer_slider.setValue(self.layer_slider.value() + (1 if command == "up" else -1))
+
+    def _move_moved(self, _value: int) -> None:
+        self._show_toolpath()
 
     def _show_toolpath(self) -> None:
         if self.toolpath is None or not self.preview_button.isChecked():
             return
         kinds = {kind for kind, box in self.kind_boxes.items() if box.isChecked()}
-        self.view.set_toolpath(self.toolpath, self.layer_slider.value(), kinds, self.travel_box.isChecked())
+        limit = self.move_slider.value()
+        first, last = self.move_slider.minimum(), self.move_slider.maximum()
+        self.move_label.setText(f"Bahn {limit - first + 1} von {last - first + 1}")
+        self.view.set_toolpath(self.toolpath, self.layer_slider.value(), kinds, self.travel_box.isChecked(),
+                               limit=limit, solid=self.solid_box.isChecked())
+
+    # --- Druckablauf abspielen (Runde 92) -------------------------------------------------------------------
+
+    _PLAY_SECONDS = {0: 8.0, 1: 3.0, 2: 1.0, 3: 0.3}      # so lange dauert eine Schicht je Tempo
+
+    def _play_toggled(self, on: bool) -> None:
+        if on and self.toolpath is not None:
+            if self.layer_slider.value() >= self.layer_slider.maximum() \
+                    and self.move_slider.value() >= self.move_slider.maximum():
+                self._jump_to_layer(0)              # am Ende: von vorn beginnen
+            self._play_timer.start()
+        else:
+            self._play_timer.stop()
+        self.play_button.setIcon(icon("pause" if on else "play"))
+
+    def _jump_to_layer(self, layer: int) -> None:
+        """Schicht wählen und den Ablauf an ihren Anfang setzen (beim Abspielen)."""
+        self._playing_layer_start = True
+        try:
+            self.layer_slider.setValue(layer)
+            self.move_slider.setValue(self.move_slider.minimum())
+        finally:
+            self._playing_layer_start = False
+
+    def _play_step(self) -> None:
+        """Ein Takt des Abspielens: einige Bahnen weiter; am Ende der Schicht die nächste, am Ende Halt."""
+        span = max(self.move_slider.maximum() - self.move_slider.minimum(), 1)
+        ticks = self._PLAY_SECONDS[self.speed_box.currentIndex()] * 1000 / self._play_timer.interval()
+        step = max(1, int(round(span / max(ticks, 1))))
+        if self.move_slider.value() < self.move_slider.maximum():
+            self.move_slider.setValue(min(self.move_slider.value() + step, self.move_slider.maximum()))
+        elif self.layer_slider.value() < self.layer_slider.maximum():
+            self._jump_to_layer(self.layer_slider.value() + 1)
+        else:
+            self.play_button.setChecked(False)
 
     # --- Slicen -------------------------------------------------------------------------------------------
 
@@ -1426,6 +1769,7 @@ class PrintWorkspace(QWidget):
         count = max(self.toolpath.layer_count, 1)
         self.layer_slider.setRange(0, count - 1)
         self.layer_slider.setValue(count - 1)
+        self._layer_moved(self.layer_slider.value())     # Ablauf-Regler auf die Bahnen der obersten Schicht
         for kind, box in self.kind_boxes.items():
             box.setVisible(kind in self.toolpath.segments)
         info = self.toolpath.info
@@ -1612,7 +1956,7 @@ class PrintWorkspace(QWidget):
                 rate = sent / max(time.monotonic() - started, 1e-3) / 1e6
                 self._relay.later(lambda: self._show_upload(share, sent, total, rate))
 
-        future = self._pool.submit(printer.upload, self.gcode_path, start, name, progress)
+        future = self._upload_pool.submit(printer.upload, self.gcode_path, start, name, progress)
 
         def done(result) -> None:
             self.upload_bar.setVisible(False)
@@ -1629,7 +1973,14 @@ class PrintWorkspace(QWidget):
         future.add_done_callback(lambda result: self._relay.later(lambda: done(result)))
 
     def _show_upload(self, share: int, sent: int, total: int, rate: float) -> None:
-        """Stand des Hochladens: Balken mit Prozent, gesendete und gesamte Größe, Tempo."""
+        """Stand des Hochladens: Balken mit Prozent, gesendete und gesamte Größe, Tempo.
+
+        Höchstens fünfmal je Sekunde (und am Ende): jede Anzeige lässt Qt das ganze Fenster samt großer 3D-Ansicht neu
+        zusammensetzen – bei jedem gesendeten Stück bremste das das Hochladen aus (Runde 96: 2 MB über 10 s)."""
+        now = time.monotonic()
+        if share < 1000 and now - getattr(self, "_upload_shown", 0.0) < 0.2:
+            return
+        self._upload_shown = now
         self.upload_bar.setValue(share)
         mb = lambda value: f"{value / 1e6:.1f}".replace(".", ",")
         self.upload_bar.setFormat(f"{share / 10:.0f} %  –  {mb(sent)} von {mb(total)} MB  ({mb(rate * 1e6)} MB/s)")
@@ -1643,3 +1994,4 @@ class PrintWorkspace(QWidget):
             self._process.kill()
             self._process.waitForFinished(2000)
         self._pool.shutdown(wait=False, cancel_futures=True)
+        self._upload_pool.shutdown(wait=False, cancel_futures=True)

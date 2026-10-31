@@ -9,6 +9,6 @@ GEWÄHRLEISTUNG – sogar ohne die implizite Gewährleistung der MARKTREIFE oder
 ZWECK. Einzelheiten in der Datei LICENSE (englischer Originaltext der GPL-3.0).
 """
 
-__version__ = "2026.10.29"
+__version__ = "2026.10.31"
 __license__ = "GPL-3.0-or-later"
 __copyright__ = "Copyright (C) 2026 Skye und die WolfCAD-Mitwirkenden"

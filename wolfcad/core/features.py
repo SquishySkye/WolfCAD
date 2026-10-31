@@ -33,11 +33,12 @@ from OCP.GProp import GProp_GProps
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
 from OCP.collections import (
+    Array1_gp_Pnt2d,
     IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
     IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher,
 )
 from OCP.GeomAbs import GeomAbs_C0
-from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt, gp_Trsf, gp_Vec
+from OCP.gp import gp_Ax2, gp_Circ, gp_Dir, gp_Pnt, gp_Pnt2d, gp_Trsf, gp_Vec
 from OCP.TopAbs import TopAbs_EDGE, TopAbs_FACE, TopAbs_IN, TopAbs_SOLID, TopAbs_VERTEX, TopAbs_WIRE
 from OCP.TopExp import TopExp, TopExp_Explorer
 from OCP.TopoDS import TopoDS, TopoDS_Compound, TopoDS_Shape
@@ -58,9 +59,23 @@ OPERATIONS = ("Neuer Körper", "Vereinigen", "Ausschneiden", "Schnittmenge")
 # Länge) oder auf jeder Seite mit eigenem Abstand
 CHAMFER_KINDS = ("Gleicher Abstand", "Zwei Abstände", "Abstand und Winkel")
 CHAMFER_FIELDS = {"distance2": (CHAMFER_KINDS[1],), "angle": (CHAMFER_KINDS[2],)}   # Felder je Art der Fase
+# Rundung wie in Fusion (Runde 91): drei Arten, beim gewöhnlichen Abrunden drei Radiusarten
+FILLET_KINDS = ("Verrundung", "Regelverrundung", "Volle Rundung")
+RADIUS_KINDS = ("Konstant", "Sehnenlänge", "Variabel")
+RULE_SCOPES = ("Alle Kanten", "Kanten der gewählten Flächen")
+# Felder je Art der Rundung bzw. je Radiusart (die übrigen blendet das Eigenschaftenfeld aus)
+FILLET_FIELDS = {"radius": FILLET_KINDS[:2], "radius_type": FILLET_KINDS[:1], "edge_points": FILLET_KINDS[:1],
+                 "sets": FILLET_KINDS[:1], "wall_aware": FILLET_KINDS[:1], "rule_scope": FILLET_KINDS[1:2],
+                 "rule_rounds": FILLET_KINDS[1:2], "rule_fillets": FILLET_KINDS[1:2], "face_points": FILLET_KINDS[1:]}
+RADIUS_FIELDS = {"radius2": RADIUS_KINDS[2:], "mid_radius": RADIUS_KINDS[2:], "mid_position": RADIUS_KINDS[2:]}
 EXTENTS = ("Eine Seite", "Symmetrisch", "Zwei Seiten", "Bis Fläche", "Durch alles")
 # Welche Felder einer Extrusion bei welcher Richtung gelten (die übrigen blendet das Eigenschaftenfeld aus)
-EXTENT_FIELDS = {"distance": EXTENTS[:3], "distance2": (EXTENTS[2],), "target_points": (EXTENTS[3],)}
+EXTENT_FIELDS = {"distance": EXTENTS[:3], "distance2": (EXTENTS[2],), "target_points": (EXTENTS[3],),
+                 "taper2": (EXTENTS[2],)}
+# Art der Extrusion wie Fusion (Runde 93): voller Körper oder dünne Wand mit Dicke, innen/außen/mittig am Umriss
+EXTRUDE_TYPES = ("Körper", "Dünn")
+WALL_SIDES = ("Innen", "Außen", "Mitte")
+EXTRUDE_TYPE_FIELDS = {"wall": EXTRUDE_TYPES[1:], "wall_side": EXTRUDE_TYPES[1:]}
 # Was ein Import anzeigt
 # „Nur Quelle der Endstände“: der Blob wird eingelesen, zeigt aber selbst nichts – bei übernommener Fusion-Timeline
 # setzen die einzelnen Schritte ihre gespeicherten Endstände ein (sonst gäbe es jeden Körper doppelt)
@@ -422,8 +437,24 @@ class Extrude(Feature):
     target_points: list = field(default_factory=list)   # „Bis Fläche“: Merkpunkt der ebenen Zielfläche
     # Wie in Fusion: statt eines Skizzenprofils ebene Körperflächen aufziehen (Merkpunkte der Flächen)
     face_points: list = field(default_factory=list)
+    # --- seit Runde 93 (Fusion-Funktionen) ---
+    extrude_type: str = EXTRUDE_TYPES[0]    # „Dünn“: nur eine Wand am Umriss des Profils
+    wall: float = 1.0                       # Wandstärke der dünnen Extrusion
+    wall_side: str = WALL_SIDES[0]          # Lage der Wand zum Umriss: innen, außen oder mittig
+    taper2: float = 0.0                     # Verjüngung der zweiten Seite (nur „Zwei Seiten“)
+    # Beteiligte Körper wie Fusion (Runde 96): Namen, durch Komma getrennt; leer = alle berührten
+    participants: str = ""
 
     KIND = "Extrusion"
+
+    # Reihenfolge im Eigenschaftenfeld wie in Fusion: Art, Profil, Start, Richtung, Maße, Verjüngung, Operation
+    _ORDER = ("extrude_type", "sketch", "regions", "region_points", "extra_profiles", "face_points", "start",
+              "extent", "distance", "distance2", "target_points", "taper", "taper2", "wall", "wall_side",
+              "operation", "participants")
+
+    def parameters(self) -> list:
+        rank = {name: number for number, name in enumerate(self._ORDER)}
+        return sorted(super().parameters(), key=lambda item: rank.get(item.name, len(rank)))
 
     def profile_list(self, state: BuildState) -> list[tuple]:
         """Die aufzuziehenden Profile mit ihrer Richtung: [(Fläche, Normale), …] – aus Körperflächen und Skizzen
@@ -450,7 +481,40 @@ class Extrude(Feature):
                              state.normals[name]))
         return found + profiles
 
+    def _open_thin(self, state: BuildState) -> bool:
+        """Dünne Extrusion einer offenen Linie (Fusion: dünn extrudieren, auch ohne geschlossenes Profil, Runde 96):
+        die Linien werden zur Wandfläche gezogen und um die Wandstärke aufgedickt. True, wenn das zutraf."""
+        if self.extrude_type != EXTRUDE_TYPES[1] or not self.sketch or self.sketch in state.profiles \
+                or self.sketch not in state.curves or self.face_points or self.extra_profiles:
+            return False
+        if self.extent not in EXTENTS[:3]:
+            raise FeatureError("Offene Linien lassen sich nur um einen Abstand dünn extrudieren")
+        if abs(self.distance) < 1e-9:
+            raise FeatureError(ZERO_DISTANCE_MESSAGE)
+        from .surfaces import thicken_sheet
+        normal = gp_Vec(*state.normals[self.sketch])
+        pieces = [self.distance / 2, -self.distance / 2] if self.extent == EXTENTS[1] else \
+            [self.distance, -abs(self.distance2) if self.distance > 0 else abs(self.distance2)] \
+            if self.extent == EXTENTS[2] else [self.distance]
+        low, high = min(0.0, *pieces) + self.start, max(0.0, *pieces) + self.start
+        shift = gp_Trsf()
+        shift.SetTranslation(normal * low)
+        curves = BRepBuilderAPI_Transform(state.curves[self.sketch], shift, True).Shape()
+        sheet = BRepPrimAPI_MakePrism(curves, normal * (high - low)).Shape()
+        if self.wall_side == WALL_SIDES[2]:
+            # mittig: nach beiden Seiten je die halbe Wand aufdicken und vereinigen (eine offene Fläche lässt sich
+            # nicht vorher versetzen)
+            solid = unified(_boolean(BRepAlgoAPI_Fuse, thicken_sheet(sheet, self.wall / 2),
+                                     thicken_sheet(sheet, -self.wall / 2)))
+        else:
+            solid = thicken_sheet(sheet, self.wall if self.wall_side == WALL_SIDES[1] else -self.wall)
+        chosen = {name.strip() for name in self.participants.split(",") if name.strip()}
+        _combine(state, solid, self.operation, names=chosen or None)
+        return True
+
     def apply(self, state: BuildState) -> None:
+        if self._open_thin(state):
+            return
         profiles = self.profile_list(state)
         if self.extent not in EXTENTS:
             raise FeatureError(f"Unbekannte Richtung '{self.extent}'")
@@ -458,8 +522,12 @@ class Extrude(Feature):
             raise FeatureError(ZERO_DISTANCE_MESSAGE)
         if self.extent == EXTENTS[2] and abs(self.distance2) < 1e-9:
             raise FeatureError("Der Abstand der zweiten Seite darf nicht 0 sein")
-        if not -89.0 < self.taper < 89.0:
+        if not -89.0 < self.taper < 89.0 or not -89.0 < self.taper2 < 89.0:
             raise FeatureError("Die Verjüngung muss zwischen -89 und 89 Grad liegen")
+        if self.extrude_type not in EXTRUDE_TYPES or self.wall_side not in WALL_SIDES:
+            raise FeatureError("Unbekannte Art der Extrusion bzw. Lage der Wand")
+        if self.extrude_type == EXTRUDE_TYPES[1] and self.wall <= 0:
+            raise FeatureError("Die Wandstärke der dünnen Extrusion muss größer als 0 sein")
         target = None
         if self.extent == EXTENTS[3]:
             target = self._target_plane(state, profiles[0])
@@ -482,13 +550,20 @@ class Extrude(Feature):
                 shift = gp_Trsf()
                 shift.SetTranslation(gp_Vec(*normal) * self.start)
                 profile = BRepBuilderAPI_Transform(profile, shift, True).Shape()
+            if self.extrude_type == EXTRUDE_TYPES[1]:
+                profile = _thin_profile(profile, self.wall, self.wall_side)
             # ein einziger Körper über alle Abschnitte: zwei Teile zu vereinigen, verträgt der Kern bei
             # verjüngten Seiten nicht zuverlässig
-            solid = _extruded(profile, normal, pieces, self.taper)
+            second = self.taper2 if self.extent == EXTENTS[2] else None
+            solid = _extruded(profile, normal, pieces, self.taper, second)
             if target is not None and target[1] is not None:
                 # schräge Zielfläche: weit genug ziehen und an ihrer Ebene abschneiden
                 solid = _boolean(BRepAlgoAPI_Common, solid, target[1])
-            _combine(state, solid, self.operation)
+            chosen = {name.strip() for name in self.participants.split(",") if name.strip()}
+            missing = [name for name in chosen if name not in state.bodies]
+            if missing:
+                raise FeatureError(f"Beteiligter Körper nicht vorhanden: {', '.join(missing)}")
+            _combine(state, solid, self.operation, names=chosen or None)
 
     def _target_plane(self, state: BuildState, first) -> tuple[float, TopoDS_Shape | None]:
         """„Bis Fläche“: (Länge bis zur Zielebene, Halbraum zum Abschneiden bei schräger Fläche oder None)."""
@@ -565,16 +640,18 @@ def _plane_normal(face) -> tuple[float, float, float]:
     return direction.X(), direction.Y(), direction.Z()
 
 
-def _extruded(profile, normal: tuple, lengths: list, taper: float) -> TopoDS_Shape:
+def _extruded(profile, normal: tuple, lengths: list, taper: float, taper2: float | None = None) -> TopoDS_Shape:
     """Das Profil längs der Normale gezogen, über alle Abschnitte `lengths` (vom Profil aus, mit Vorzeichen).
 
     Ohne Verjüngung ein Prisma vom tiefsten zum höchsten Punkt; mit Verjüngung eine geradlinige Erhebung durch
-    versetzte Kopien des Profils – je weiter vom Profil entfernt, desto stärker versetzt.
+    versetzte Kopien des Profils – je weiter vom Profil entfernt, desto stärker versetzt. `taper2` gilt (wenn
+    angegeben) für die Abschnitte gegen die Normale, also die zweite Seite.
     """
     import math as _math
     positions = sorted({0.0, *[float(length) for length in lengths]})
     low, high = positions[0], positions[-1]
-    if abs(taper) < 1e-9:
+    angle_at = lambda position: taper2 if taper2 is not None and position < 0 else taper
+    if all(abs(angle_at(position)) < 1e-9 for position in positions):
         shift = gp_Trsf()
         shift.SetTranslation(gp_Vec(*normal) * low)
         start = BRepBuilderAPI_Transform(profile, shift, True).Shape()
@@ -607,7 +684,7 @@ def _extruded(profile, normal: tuple, lengths: list, taper: float) -> TopoDS_Sha
                 sections.append([outer, *holes])
                 continue
             offset = BRepOffsetAPI_MakeOffset(face, GeomAbs_Intersection)
-            offset.Perform(-abs(position) * _math.tan(_math.radians(taper)))    # positiv verjüngt: kleiner
+            offset.Perform(-abs(position) * _math.tan(_math.radians(angle_at(position))))  # positiv: kleiner
             if not offset.IsDone():
                 raise FeatureError("Mit dieser Verjüngung verschwindet das Profil (Winkel oder Abstand zu groß)")
             move = gp_Trsf()
@@ -644,6 +721,53 @@ def _extruded(profile, normal: tuple, lengths: list, taper: float) -> TopoDS_Sha
     return result
 
 
+def _offset_face(face, distance: float) -> TopoDS_Shape:
+    """Die ebene Fläche um `distance` nach außen (positiv) bzw. innen gewachsen, samt Löchern."""
+    from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffset
+    from OCP.GeomAbs import GeomAbs_Arc
+    from OCP.ShapeFix import ShapeFix_Face
+    if abs(distance) < 1e-12:
+        return face
+    offset = BRepOffsetAPI_MakeOffset(TopoDS.Face(face), GeomAbs_Arc)
+    offset.Perform(distance)
+    if not offset.IsDone():
+        raise FeatureError("Die Wand lässt sich so nicht bilden (Wandstärke zu groß für das Profil)")
+    wires, walker = [], TopExp_Explorer(offset.Shape(), TopAbs_WIRE)
+    while walker.More():
+        wires.append(TopoDS.Wire(walker.Current()))
+        walker.Next()
+    if not wires:
+        raise FeatureError("Die Wand lässt sich so nicht bilden (das Profil verschwindet)")
+
+    def size(wire) -> float:
+        box = Bnd_Box()
+        BRepBndLib.Add_s(wire, box)
+        return box.SquareExtent()
+    wires.sort(key=size, reverse=True)
+    maker = BRepBuilderAPI_MakeFace(wires[0], True)
+    for hole in wires[1:]:
+        maker.Add(TopoDS.Wire(hole.Reversed()))
+    fixer = ShapeFix_Face(maker.Face())
+    fixer.FixOrientation()
+    fixer.Perform()
+    return fixer.Face()
+
+
+def _thin_profile(profile, wall: float, side: str) -> TopoDS_Shape:
+    """Dünne Extrusion (Fusion „Dünn extrudieren“): aus dem Profil nur ein Band der Breite `wall` entlang aller
+    Ränder – innen am Umriss, außen oder mittig. Das Band ist Profil-nach-außen minus Profil-nach-innen."""
+    outward, inward = {WALL_SIDES[0]: (0.0, wall), WALL_SIDES[1]: (wall, 0.0),
+                       WALL_SIDES[2]: (wall / 2, wall / 2)}[side]
+    bands = None
+    for face in faces_of(profile):
+        band = _boolean(BRepAlgoAPI_Cut, _offset_face(face, outward), _offset_face(face, -inward)) \
+            if inward > 0 else _boolean(BRepAlgoAPI_Cut, _offset_face(face, outward), face)
+        bands = band if bands is None else _boolean(BRepAlgoAPI_Fuse, bands, band)
+    if bands is None or not faces_of(bands):
+        raise FeatureError("Die Wand lässt sich so nicht bilden")
+    return bands
+
+
 def _wire_centre(wire) -> tuple:
     properties = GProp_GProps()
     BRepGProp.LinearProperties_s(wire, properties)
@@ -676,7 +800,7 @@ def profile_of(state: BuildState, sketch: str, regions: str, points: list = ()) 
 
 
 def _combine(state: BuildState, solid: TopoDS_Shape, operation: str, origin: int | None = None,
-             participants: set | None = None) -> None:
+             participants: set | None = None, names: set | None = None) -> None:
     """Verrechnet ein neues Volumen gemäß der gewählten Operation mit dem Modell.
 
     Wie in Fusion wirken Vereinigen, Ausschneiden und Schnittmenge nur auf die
@@ -689,6 +813,9 @@ def _combine(state: BuildState, solid: TopoDS_Shape, operation: str, origin: int
     touched, commons, inside = ([], {}, {}) if operation == "Neuer Körper" else touched_bodies(state, solid)
     if participants is not None:
         touched = [name for name in touched if state.body_origin.get(name) in participants]
+    if names:
+        # „Beteiligte Körper“ von Hand gewählt (Runde 96): nur diese werden geschnitten bzw. vereinigt
+        touched = [name for name in touched if name in names]
     if operation == AUTO_OPERATION:
         operation = _automatic_operation(state, solid, touched, commons, inside)
     if operation not in OPERATIONS:
@@ -700,7 +827,7 @@ def _combine(state: BuildState, solid: TopoDS_Shape, operation: str, origin: int
         pieces = _connected_pieces(solid)
         if len(pieces) > 1:
             for piece in pieces:
-                _combine(state, piece, operation, origin, participants)
+                _combine(state, piece, operation, origin, participants, names)
             return
         # ein zusammenhängendes Teil: mit der vereinigten Form weiterrechnen – bisher blieb hier das unvereinigte
         # Volumen stehen (z. B. zwei Dreiecke eines durch eine Linie geteilten Profils als zwei Volumenkörper in
@@ -1295,8 +1422,17 @@ def _modify_edges(state: BuildState, modify, body: str, points: list) -> None:
 
 @dataclass
 class Fillet(Feature):
-    """Verrundet die gewählten Kanten mit einem festen Radius; ohne Auswahl alle
-    scharfen Kanten der gewählten Körper."""
+    """Verrundet Kanten wie Fusion „Abrunden“.
+
+    Drei Arten (`fillet_type`):
+    - Verrundung: die gewählten Kanten; Radius konstant, über die Sehnenlänge oder variabel (Anfang, ein
+      Zwischenpunkt, Ende). Weitere Auswahlsätze (`sets`) runden andere Kanten im selben Schritt mit eigenem Radius.
+    - Regelverrundung: alle scharfen Kanten des Körpers bzw. der gewählten Flächen, wahlweise nur Außenkanten
+      (Rundungen) oder nur Innenkanten (Kehlen).
+    - Volle Rundung: über eine Mittelfläche (z. B. Oberseite einer Rippe) zwischen zwei parallelen Seitenflächen;
+      der Radius ergibt sich aus deren Abstand.
+    Ohne gewählte Kanten (nur ältere Entwürfe) werden alle scharfen Kanten gerundet.
+    """
 
     radius: float = 2.0
     radius2: float = 0.0        # variabler Radius: am Ende der Kante (0 = überall gleich)
@@ -1311,31 +1447,309 @@ class Fillet(Feature):
     # plus Wandstärke – beide Bögen konzentrisch (sonst wird die Wand in der Biegung dicker). Neu angelegte Rundungen
     # haben das eingeschaltet, ältere Entwürfe nicht
     wall_aware: bool = False
+    # --- seit Runde 91 (Fusion-Funktionen) ---
+    fillet_type: str = FILLET_KINDS[0]
+    radius_type: str = RADIUS_KINDS[0]
+    mid_radius: float = 0.0     # variabel: Radius am Zwischenpunkt (0 = kein Zwischenpunkt)
+    mid_position: float = 0.5   # variabel: Lage des Zwischenpunkts längs der Kante (0 = Anfang, 1 = Ende)
+    # weitere Auswahlsätze wie das „+“ in Fusion: je Eintrag {"radius": mm, "edge_points": [...]}
+    sets: list = field(default_factory=list)
+    rule_scope: str = RULE_SCOPES[0]
+    rule_rounds: bool = True    # Regelverrundung: Außenkanten (Rundungen)
+    rule_fillets: bool = True   # Regelverrundung: Innenkanten (Kehlen)
+    face_points: list = field(default_factory=list)     # Flächen der Regel- bzw. Mittelflächen der vollen Rundung
 
     KIND = "Verrundung"
 
+    def __post_init__(self) -> None:
+        # vor Runde 91 gab es keine Radiusart: ein abweichender Radius am Ende hieß „variabel“ (ältere Entwürfe,
+        # Fusion-Übernahme und Code, der Fillet(radius=…, radius2=…) anlegt)
+        if self.radius_type == RADIUS_KINDS[0] and self.radius2 > 0 and abs(self.radius2 - self.radius) > 1e-9:
+            self.radius_type = RADIUS_KINDS[2]
+
+    def to_dict(self) -> dict:
+        data = super().to_dict()
+        if self.radius_type != RADIUS_KINDS[2]:
+            # ungenutzter Endradius: nicht speichern, sonst hielte __post_init__ die Rundung beim Laden für variabel
+            data["radius2"] = 0.0
+        return data
+
+    # Reihenfolge im Eigenschaftenfeld wie in Fusion: Art, Auswahl, Sätze, Radiusart, Maße, Optionen
+    _ORDER = ("fillet_type", "body", "edge_points", "face_points", "sets", "radius_type", "radius", "radius2",
+              "mid_radius", "mid_position", "rule_scope", "rule_rounds", "rule_fillets", "wall_aware")
+
     def parameters(self) -> list:
-        return [item for item in super().parameters() if item.name != "require_pick"]
+        items = [item for item in super().parameters() if item.name != "require_pick"]
+        rank = {name: number for number, name in enumerate(self._ORDER)}
+        return sorted(items, key=lambda item: rank.get(item.name, len(rank)))
+
+    def _groups(self) -> list[tuple[float, float, list]]:
+        """(Radius am Anfang, am Ende, Kantenpunkte) je Auswahlsatz; der erste ist der gerade bearbeitete."""
+        variable = self.radius_type == RADIUS_KINDS[2]
+        # der gerade bearbeitete Satz zählt erst, wenn er Kanten hat (sonst steht er nach „+“ leer bei 0)
+        groups = [(self.radius, self.radius2 if variable else 0.0, self.edge_points)] if self.edge_points or \
+            not any(entry.get("edge_points") for entry in self.sets) else []
+        for entry in self.sets:
+            # die Liste selbst (keine Kopie): hat ein früherer Schritt eine Kante verschoben, führt find_by_points
+            # ihren Merkpunkt darin nach
+            if entry.get("edge_points"):
+                groups.append((float(entry.get("radius", self.radius)), 0.0, entry["edge_points"]))
+        return groups
 
     def apply(self, state: BuildState) -> None:
-        if self.radius <= 0:
+        if self.fillet_type not in FILLET_KINDS:
+            raise FeatureError(f"Unbekannte Art der Rundung '{self.fillet_type}'")
+        if self.fillet_type == FILLET_KINDS[2]:
+            self._full_round(state)
+            return
+        finished_sets = any(entry.get("edge_points") for entry in self.sets) and self.fillet_type == FILLET_KINDS[0]
+        if self.radius <= 0 and (self.edge_points or not finished_sets):
             raise FeatureError("Der Radius muss größer als 0 sein")
-        if self.require_pick and not self.edge_points:
+        if self.fillet_type == FILLET_KINDS[1]:
+            self._rule_fillet(state)
+            return
+        if self.radius_type not in RADIUS_KINDS:
+            raise FeatureError(f"Unbekannte Radiusart '{self.radius_type}'")
+        groups = self._groups()
+        for radius, _end, _points in groups:
+            if radius <= 0:
+                raise FeatureError("Der Radius jedes Auswahlsatzes muss größer als 0 sein")
+        points = [point for _start, _end, group in groups for point in group]
+        if self.require_pick and not points:
             raise FeatureError(PICK_EDGES_MESSAGE)
+        if self.radius_type == RADIUS_KINDS[2] and self.mid_radius > 0 and not 0.0 < self.mid_position < 1.0:
+            raise FeatureError("Der Zwischenpunkt liegt zwischen 0 (Anfang) und 1 (Ende) der Kante")
+        largest = max([self.radius, self.radius2, self.mid_radius, *[start for start, _e, _g in groups]])
 
         def fillet(body: TopoDS_Shape, edges: list, scale: float = 1.0) -> TopoDS_Shape:
             maker = BRepFilletAPI_MakeFillet(body)
+            # Kante -> (Radius Anfang, Ende, gehört zum bearbeiteten Satz); jeder Satz sucht seine Kanten selbst
+            plan = _edge_plan(body, groups, edges, (self.radius, 0.0), main=self.edge_points)
+            edges = [edge for edge, _start, _end, _main in plan]
             # Außenkanten gleich starker Wände: Radius plus Wandstärke (je Kante der Zuschlag)
             extra = wall_outer_extra(body, edges) if self.wall_aware else {}
-            for number, edge in enumerate(edges):
-                if self.radius2 > 0 and abs(self.radius2 - self.radius) > 1e-9:
+            for number, (edge, start, end, main) in enumerate(plan):
+                if self.radius_type == RADIUS_KINDS[1] and main:
+                    start = _radius_from_chord(body, edge, start)       # Sehnenlänge -> Radius je Kante
+                if main and self.radius_type == RADIUS_KINDS[2] and self.mid_radius > 0:
+                    # variabel mit Zwischenpunkt: Radius über die (relative) Lage auf der Kante interpoliert
+                    maker.Add(TopoDS.Edge(edge))
+                    table = Array1_gp_Pnt2d(1, 3)
+                    table.SetValue(1, gp_Pnt2d(0.0, start * scale))
+                    table.SetValue(2, gp_Pnt2d(self.mid_position, self.mid_radius * scale))
+                    table.SetValue(3, gp_Pnt2d(1.0, (end if end > 0 else start) * scale))
+                    maker.SetRadius(table, maker.Contour(TopoDS.Edge(edge)), 1)
+                elif end > 0 and abs(end - start) > 1e-9:
                     # variable Verrundung: der Radius wächst gleichmäßig vom Anfang zum Ende der Kante
-                    maker.Add(self.radius * scale, self.radius2 * scale, TopoDS.Edge(edge))
+                    maker.Add(start * scale, end * scale, TopoDS.Edge(edge))
                 else:
-                    maker.Add((self.radius + extra.get(number, 0.0)) * scale, edge)
+                    maker.Add((start + extra.get(number, 0.0)) * scale, edge)
             return _finish(maker, "Verrundung", "Radius")
 
-        _modify_edges(state, _with_full_round(fillet, max(self.radius, self.radius2)), self.body, self.edge_points)
+        _modify_edges(state, _with_full_round(fillet, largest), self.body, points)
+
+    def _rule_fillet(self, state: BuildState) -> None:
+        """Regelverrundung: alle scharfen Kanten (bzw. die Ränder der gewählten Flächen), gefiltert nach Außen-
+        und Innenkanten – wie Fusion „Regelverrundung“ mit „Rundungen“/„Kehlen“."""
+        if not (self.rule_rounds or self.rule_fillets):
+            raise FeatureError("Bitte Rundungen (Außenkanten), Kehlen (Innenkanten) oder beides einschalten")
+        if self.rule_scope not in RULE_SCOPES:
+            raise FeatureError(f"Unbekannter Umfang '{self.rule_scope}'")
+        if self.rule_scope == RULE_SCOPES[1] and not self.face_points:
+            raise FeatureError("Für die Regelverrundung an Flächen bitte Flächen in der Ansicht anklicken")
+        changed = False
+        for name in select_bodies(state, self.body):
+            body = state.bodies[name]
+            edges = _sharp_edges(body)
+            if self.rule_scope == RULE_SCOPES[1]:
+                try:
+                    faces = find_by_points(faces_of(body), face_point, self.face_points, "Fläche")
+                except FeatureError:
+                    continue            # die Flächen gehören zu einem anderen Körper
+                rims = [edge for face in faces for edge in unique_edges(face)]
+                edges = [edge for edge in edges if any(edge.IsSame(rim) for rim in rims)]
+            edges = [edge for edge in edges
+                     if (self.rule_fillets if _edge_is_concave(body, edge) else self.rule_rounds)]
+            if edges:
+                build = lambda shape, chosen, scale=1.0: _fillet_all(shape, chosen, self.radius * scale)
+                state.bodies[name] = _with_full_round(build, self.radius)(body, edges)
+                changed = True
+        if not changed:
+            raise FeatureError("Keine passenden Kanten für die Regelverrundung gefunden")
+
+    def _full_round(self, state: BuildState) -> None:
+        """Volle Rundung: je Mittelfläche die beiden Kanten zu den zwei parallelen Seitenflächen mit dem halben
+        Abstand der Seiten runden – die Mittelfläche verschwindet, es bleibt ein Halbzylinder (wie Fusion)."""
+        if not self.face_points:
+            raise FeatureError("Für die volle Rundung bitte die Mittelfläche (z. B. Oberseite einer Rippe) anklicken")
+        changed = False
+        for name in select_bodies(state, self.body):
+            body = state.bodies[name]
+            try:
+                centres = find_by_points(faces_of(body), face_point, self.face_points, "Fläche")
+            except FeatureError:
+                continue
+            edges, radius = [], 0.0
+            for centre in centres:
+                pair = _full_round_sides(body, centre)
+                if pair is None:
+                    raise FeatureError("Volle Rundung: neben der Mittelfläche liegen keine zwei parallelen ebenen "
+                                       "Seitenflächen (bitte die Fläche zwischen den Seiten wählen)")
+                rims, gap = pair
+                edges += rims
+                radius = max(radius, gap / 2)
+            build = lambda shape, chosen, scale=1.0: _fillet_all(shape, chosen, radius * scale)
+            state.bodies[name] = _with_full_round(build, radius)(body, edges)
+            changed = True
+        if not changed:
+            raise FeatureError("Die Mittelfläche liegt nicht auf dem gewählten Körper")
+
+
+def _edge_plan(body: TopoDS_Shape, groups: list, fallback: list, sizes: tuple, main=None) -> list:
+    """[(Kante, Maß Anfang, Maß Ende, zum bearbeiteten Satz?)] für die Auswahlsätze einer Rundung bzw. Fase.
+
+    Jeder Satz sucht seine Kanten in seiner eigenen Merkpunktliste (das Nachführen verschobener Kanten schreibt
+    dorthin zurück). Eine Kante in mehreren Sätzen zählt nur im ersten. Ohne jede Auswahl (ältere Entwürfe)
+    gelten die `fallback`-Kanten (alle scharfen) mit den Maßen `sizes`. `main` ist die Merkpunktliste des gerade
+    bearbeiteten Satzes (nur für ihn gelten Sehnenlänge und Zwischenpunkt)."""
+    if not any(group[-1] for group in groups):
+        return [(edge, *sizes, True) for edge in fallback]
+    edges = unique_edges(body)
+    plan = []
+    for *measures, points in groups:
+        if not points:
+            continue
+        start, end = (measures + [0.0])[:2]
+        for edge in find_by_points(edges, edge_point, points, "Kante"):
+            if not any(edge.IsSame(other) for other, *_rest in plan):
+                plan.append((edge, start, end, points is main))
+    return plan
+
+
+def _fillet_all(body: TopoDS_Shape, edges: list, radius: float) -> TopoDS_Shape:
+    """Rundet alle `edges` mit demselben Radius in einem Schritt."""
+    maker = BRepFilletAPI_MakeFillet(body)
+    for edge in edges:
+        maker.Add(radius, TopoDS.Edge(edge))
+    return _finish(maker, "Verrundung", "Radius")
+
+
+def _face_normal_at(face, point: gp_Pnt) -> gp_Vec | None:
+    """Nach außen zeigende Normale der Fläche am (nächsten) Punkt; None, wenn sie dort nicht bestimmbar ist."""
+    from OCP.BRepLProp import BRepLProp_SLProps
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    from OCP.TopAbs import TopAbs_REVERSED
+    face = TopoDS.Face(face)
+    projector = GeomAPI_ProjectPointOnSurf(point, BRep_Tool.Surface_s(face))
+    if projector.NbPoints() == 0:
+        return None
+    u, v = projector.LowerDistanceParameters()
+    props = BRepLProp_SLProps(BRepAdaptor_Surface(face), u, v, 1, 1e-7)
+    if not props.IsNormalDefined():
+        return None
+    normal = gp_Vec(props.Normal().XYZ())
+    if face.Orientation() == TopAbs_REVERSED:
+        normal.Reverse()
+    return normal
+
+
+def _edge_frame(body: TopoDS_Shape, edge):
+    """(Mittelpunkt, Tangente, Fläche A, Fläche B, Normale A, Normale B) einer Kante mit zwei Nachbarflächen."""
+    neighbours = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapesAndAncestors_s(body, TopAbs_EDGE, TopAbs_FACE, neighbours)
+    if not neighbours.Contains(edge):
+        return None
+    faces = list(neighbours.FindFromKey(edge))
+    if len(faces) != 2:
+        return None
+    curve = BRepAdaptor_Curve(TopoDS.Edge(edge))
+    middle, tangent = gp_Pnt(), gp_Vec()
+    curve.D1((curve.FirstParameter() + curve.LastParameter()) / 2, middle, tangent)
+    normals = [_face_normal_at(face, middle) for face in faces]
+    if tangent.Magnitude() < 1e-12 or None in normals:
+        return None
+    return middle, tangent.Normalized(), faces[0], faces[1], normals[0], normals[1]
+
+
+def _edge_is_concave(body: TopoDS_Shape, edge) -> bool:
+    """Innenkante (Kehle, der Körper umschließt sie) statt Außenkante (Rundung)?
+
+    In Fläche A, senkrecht zur Kante und in die Fläche hinein, zeigt die Richtung `across`. Zeigt die Normale der
+    Fläche B dorthin, knickt der Körper nach innen (Kehle), sonst nach außen."""
+    frame = _edge_frame(body, edge)
+    if frame is None:
+        return False
+    middle, tangent, face_a, _face_b, normal_a, normal_b = frame
+    across = normal_a.Crossed(tangent)
+    # die Richtung zeigen lassen, in der Fläche A tatsächlich weitergeht
+    step = max(1e-4, 1e-3 * _shape_size(body))
+    probe = middle.Translated(across.Normalized() * step)
+    classifier = BRepClass_FaceClassifier()
+    projector = _project_on_face(TopoDS.Face(face_a), probe)
+    if projector is not None:
+        classifier.Perform(TopoDS.Face(face_a), projector, 1e-6)
+        if classifier.State() != TopAbs_IN:
+            across.Reverse()
+    return across.Dot(normal_b) > 1e-9
+
+
+def _project_on_face(face, point: gp_Pnt):
+    """Flächenparameter (gp_Pnt2d) des Punkts auf der Fläche, None, wenn die Projektion scheitert."""
+    from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
+    projector = GeomAPI_ProjectPointOnSurf(point, BRep_Tool.Surface_s(face))
+    if projector.NbPoints() == 0:
+        return None
+    u, v = projector.LowerDistanceParameters()
+    return gp_Pnt2d(u, v)
+
+
+def _shape_size(shape: TopoDS_Shape) -> float:
+    box = Bnd_Box()
+    BRepBndLib.Add_s(shape, box)
+    low, high = box.CornerMin(), box.CornerMax()
+    return low.Distance(high)
+
+
+def _radius_from_chord(body: TopoDS_Shape, edge, chord: float) -> float:
+    """Radius zu einer Sehnenlänge (Fusion „Sehnenlänge“): Der Bogen spannt den Winkel θ zwischen den Normalen der
+    beiden Nachbarflächen, die Sehne ist 2·r·sin(θ/2). Ohne bestimmbaren Winkel wie bei 90° (r = Sehne / √2)."""
+    frame = _edge_frame(body, edge)
+    angle = math.pi / 2
+    if frame is not None:
+        angle = frame[4].Angle(frame[5])
+    if angle < 1e-3:
+        raise FeatureError("Sehnenlänge: die Flächen an dieser Kante gehen tangential ineinander über")
+    return chord / (2 * math.sin(angle / 2))
+
+
+def _full_round_sides(body: TopoDS_Shape, centre) -> tuple[list, float] | None:
+    """Die Kanten zwischen der Mittelfläche und zwei parallelen, ebenen Nachbarflächen (Seiten einer Rippe) und
+    der Abstand der Seiten; bei mehreren Paaren das mit dem kleinsten Abstand. None, wenn es keines gibt."""
+    from OCP.BRepAdaptor import BRepAdaptor_Surface
+    from OCP.GeomAbs import GeomAbs_Plane
+    neighbours = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+    TopExp.MapShapesAndAncestors_s(body, TopAbs_EDGE, TopAbs_FACE, neighbours)
+    sides = []          # (Kante, Nachbarfläche, Ebene)
+    for edge in unique_edges(centre):
+        if not neighbours.Contains(edge):
+            continue
+        for face in neighbours.FindFromKey(edge):
+            if face.IsSame(centre):
+                continue
+            surface = BRepAdaptor_Surface(TopoDS.Face(face))
+            if surface.GetType() == GeomAbs_Plane:
+                sides.append((edge, face, surface.Plane()))
+    best = None
+    for first in range(len(sides)):
+        for second in range(first + 1, len(sides)):
+            (edge_a, _fa, plane_a), (edge_b, _fb, plane_b) = sides[first], sides[second]
+            if not plane_a.Axis().Direction().IsParallel(plane_b.Axis().Direction(), 1e-6):
+                continue
+            gap = plane_a.Distance(plane_b.Location())
+            if gap > 1e-6 and (best is None or gap < best[1]):
+                best = ([edge_a, edge_b], gap)
+    return best
 
 
 @dataclass
@@ -1355,16 +1769,34 @@ class Chamfer(Feature):
     # schafft manche ungleiche Fase nur mit einer bestimmten Bezugsfläche.
     flip: bool = False
     require_pick: bool = False          # wie bei der Verrundung: ohne gewählte Kanten geschieht nichts
+    # weitere Auswahlsätze wie das „+“ in Fusion (Runde 91): je Eintrag {"distance": mm, "edge_points": [...]};
+    # zweiter Abstand und Winkel gelten für alle Sätze
+    sets: list = field(default_factory=list)
 
     KIND = "Fase"
 
+    # Reihenfolge im Eigenschaftenfeld wie in Fusion: Art, Auswahl, Sätze, Maße
+    _ORDER = ("chamfer_type", "body", "edge_points", "sets", "distance", "distance2", "angle", "flip")
+
     def parameters(self) -> list:
-        return [item for item in super().parameters() if item.name != "require_pick"]
+        items = [item for item in super().parameters() if item.name != "require_pick"]
+        rank = {name: number for number, name in enumerate(self._ORDER)}
+        return sorted(items, key=lambda item: rank.get(item.name, len(rank)))
 
     def apply(self, state: BuildState) -> None:
-        if self.distance <= 0:
+        finished_sets = any(entry.get("edge_points") for entry in self.sets)
+        if self.distance <= 0 and (self.edge_points or not finished_sets):
             raise FeatureError("Der Abstand muss größer als 0 sein")
-        if self.require_pick and not self.edge_points:
+        # der gerade bearbeitete Satz zählt erst, wenn er Kanten hat (sonst steht er nach „+“ leer bei 0)
+        groups = [(self.distance, self.edge_points)] if self.edge_points or not finished_sets else []
+        # die Listen selbst (keine Kopien): das Nachführen verschobener Kanten schreibt dorthin zurück
+        groups += [(float(entry.get("distance", self.distance)), entry["edge_points"])
+                   for entry in self.sets if entry.get("edge_points")]
+        points = [point for _distance, group in groups for point in group]
+        sizes = [distance for distance, _group in groups]
+        if any(distance <= 0 for distance, _group in groups):
+            raise FeatureError("Der Abstand jedes Auswahlsatzes muss größer als 0 sein")
+        if self.require_pick and not points:
             raise FeatureError(PICK_EDGES_MESSAGE)
         if self.chamfer_type not in CHAMFER_KINDS:
             raise FeatureError(f"Unbekannte Art der Fase '{self.chamfer_type}'")
@@ -1377,22 +1809,22 @@ class Chamfer(Feature):
             maker = BRepFilletAPI_MakeChamfer(body)
             neighbours = IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
             TopExp.MapShapesAndAncestors_s(body, TopAbs_EDGE, TopAbs_FACE, neighbours)
-            for edge in edges:
+            for edge, size, _end, _main in _edge_plan(body, groups, edges, (self.distance, 0.0)):
                 if self.chamfer_type == CHAMFER_KINDS[0]:
-                    maker.Add(self.distance * scale, edge)
+                    maker.Add(size * scale, edge)
                     continue
                 # ungleiche Fase: der erste Abstand gilt auf der ersten Nachbarfläche der Kante,
                 # mit „Richtung umkehren“ auf der anderen
                 faces = neighbours.FindFromKey(edge)
                 face = TopoDS.Face(faces.Last() if self.flip else faces.First())
                 if self.chamfer_type == CHAMFER_KINDS[1]:
-                    maker.Add(self.distance * scale, self.distance2 * scale, TopoDS.Edge(edge), face)
+                    maker.Add(size * scale, self.distance2 * scale, TopoDS.Edge(edge), face)
                 else:
-                    maker.AddDA(self.distance * scale, math.radians(self.angle), TopoDS.Edge(edge), face)
+                    maker.AddDA(size * scale, math.radians(self.angle), TopoDS.Edge(edge), face)
             return _finish(maker, "Fase", "Abstand")
 
-        _modify_edges(state, _with_full_round(chamfer, max(self.distance, self.distance2)), self.body,
-                      self.edge_points)
+        _modify_edges(state, _with_full_round(chamfer, max([self.distance2, *sizes, self.distance])), self.body,
+                      points)
 
 
 PARALLEL_BOOLEAN_MIN = 4           # ab so vielen auszuschneidenden Körpern wird verteilt gerechnet
@@ -2744,4 +3176,4 @@ def feature_from_dict(data: dict) -> Feature:
 
 
 # Die eigenen Volumen-Werkzeuge tragen sich beim Laden in FEATURE_CLASSES ein
-from . import extras, meshes, more_tools, sheetmetal, sketch, solids, surfaces  # noqa: E402,F401
+from . import extras, meshes, more_tools, sculpt, sheetmetal, sketch, solids, surfaces  # noqa: E402,F401

@@ -34,6 +34,11 @@ _HARMLESS_KINDS = {"Skizze", "Ebene", "Rechteck-Skizze", "Kreis-Skizze", "Versch
                    "Fusion-Körper entfernen", "Körper einfügen"}
 # Schritte, die Flächen absichtlich teilen: ihre neuen Kanten dürfen nicht wieder verschmolzen werden
 _KEEPS_FACES_SPLIT = {"Fläche teilen", "Prägen"}
+# Schritte, die nur etwas zum Anschauen in den Stand legen (eine Leinwand: Bild mit vier Ecken) und an den Körpern
+# nichts ändern. Ändert man sie, muss nichts Späteres neu gerechnet werden (Runde 90: das Verschieben einer
+# Leinwand rechnete bei jedem Mausschritt alle späteren Rundungen, Schalen … neu, mit Probelauf – es ruckelte stark)
+_DISPLAY_ONLY = {"Leinwand": "canvases"}       # Art -> das Verzeichnis im Stand, in das der Schritt schreibt
+_HARMLESS_KINDS |= set(_DISPLAY_ONLY)
 _PRIMITIVE_KINDS = {"Quader", "Zylinder", "Kugel"}      # harmlos, solange sie nicht mit Körpern verrechnet werden
 # Schritte, die nur Prismen, Zylinder oder Kopien bilden und boolesch verrechnen: der Geometriekern meldet hier
 # Fehler, statt abzustürzen (in allen Zufallstests nie abgestürzt). Ohne Probelauf bleibt das Ziehen flüssig –
@@ -41,6 +46,78 @@ _PRIMITIVE_KINDS = {"Quader", "Zylinder", "Kugel"}      # harmlos, solange sie n
 ROBUST_KINDS = {"Extrusion", "Bohrung", "Rechteckiges Muster", "Kreisförmiges Muster", "Muster entlang Pfad",
                 "Spiegeln", "Kombinieren", "Teilen", "Achse", "Fusion-Extrusion", "Fusion-Quader", "Fusion-Zylinder",
                 "Fusion-Kugel", "Fusion-Kombinieren"}
+
+
+def _pack_trial(before: BuildState, after: BuildState, feature: Feature) -> dict | None:
+    """Ergebnis eines Probelaufs zum Übertragen in den Elternprozess (Runde 93): die Körper in ihrer Reihenfolge,
+    neu entstandene bzw. veränderte Formen im Binärformat des Kerns, dazu die Felder des Schritts (er führt z. B.
+    Merkpunkte nach). None, wenn der Schritt noch anderes am Stand geändert hat – dann rechnet der Elternprozess
+    selbst (wie bisher)."""
+    import os
+    import tempfile
+    from dataclasses import fields as dataclass_fields
+    from OCP.BinTools import BinTools
+    for item in dataclass_fields(before):
+        if item.name == "bodies":
+            continue
+        old, new = getattr(before, item.name), getattr(after, item.name)
+        if isinstance(old, dict):
+            if old.keys() != new.keys() or any(old[key] is not new[key] for key in old):
+                return None
+        elif old != new:
+            return None
+    shapes = {}
+    for name, shape in after.bodies.items():
+        if before.bodies.get(name) is shape:
+            continue
+        handle, path = tempfile.mkstemp(suffix=".brep", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+        os.close(handle)
+        try:
+            BinTools.Write_s(shape, path)
+            with open(path, "rb") as source:
+                shapes[name] = source.read()
+        finally:
+            os.remove(path)
+    return {"order": list(after.bodies), "shapes": shapes, "feature": feature.to_dict()}
+
+
+def _unpack_trial(packed: dict | None, feature: Feature, state: BuildState) -> bool:
+    """Übernimmt das Ergebnis eines Probelaufs in `state`; False, wenn es keins gibt (dann selbst rechnen).
+    Ist der Schritt im Probelauf gescheitert, kommt derselbe Fehler hier (ohne zweite Rechnung)."""
+    if not packed:
+        return False
+    if "error" in packed:
+        if packed["feature_error"]:
+            raise FeatureError(packed["error"])
+        raise RuntimeError(packed["error"])
+    import os
+    import tempfile
+    from OCP.BinTools import BinTools
+    from OCP.TopoDS import TopoDS_Shape
+    bodies = {}
+    for name in packed["order"]:
+        if name in packed["shapes"]:
+            handle, path = tempfile.mkstemp(suffix=".brep", dir="/dev/shm" if os.path.isdir("/dev/shm") else None)
+            try:
+                os.write(handle, packed["shapes"][name])
+                os.close(handle)
+                shape = TopoDS_Shape()
+                BinTools.Read_s(shape, path)
+            finally:
+                os.remove(path)
+            bodies[name] = shape
+        elif name in state.bodies:
+            bodies[name] = state.bodies[name]
+        else:
+            return False                # passt nicht zusammen: lieber selbst rechnen
+    state.bodies = bodies
+    # nur, was der Probelauf am Schritt verändert hat (z. B. nachgeführte Merkpunkte der Auswahl); beide Seiten
+    # über to_dict verglichen, damit gespeicherte Vereinfachungen (Fillet: ungenutzter Endradius) nichts ändern
+    current = feature.to_dict()
+    for key, value in packed["feature"].items():
+        if key != "kind" and current.get(key) != value:
+            setattr(feature, key, value)
+    return True
 
 
 _TRIAL_SURVIVED: set[str] = set()
@@ -210,8 +287,38 @@ class Timeline:
             if not hasattr(feature, key):
                 raise AttributeError(f"{feature.KIND} hat keinen Parameter '{key}'")
             setattr(feature, key, value)
+        if self._update_display_only(index):
+            return
         # Alles vor diesem Feature bleibt unverändert und muss nicht neu berechnet werden
         self.recompute(start=index)
+
+    def _update_display_only(self, index: int) -> bool:
+        """Rechnet einen reinen Anzeige-Schritt (siehe _DISPLAY_ONLY) für sich allein neu; True, wenn das ging.
+
+        Sein Eintrag wird in den Stand nach ihm und in alle gemerkten Zwischenstände danach übernommen. Die Körper
+        und alle späteren Schritte bleiben, wie sie sind – sie hängen nicht von ihm ab. Geht es nicht sicher
+        (Zwischenstände fehlen, der Schritt ist unterdrückt oder zurückgerollt, oder er schlägt fehl), True nicht:
+        dann rechnet update wie gewohnt ab ihm."""
+        feature = self.features[index]
+        key = _DISPLAY_ONLY.get(feature.KIND)
+        if (key is None or feature.suppressed or not index < self.marker <= len(self._before)
+                or self._computed_until != self.marker or self.errors.get(index)):
+            return False
+        trial = self._before[index].copy()
+        try:
+            self.parameter_values, self.parameter_errors = resolve(self.parameters)
+            self._apply_expressions(feature)
+            feature.apply(trial)
+        except Exception:           # Fehler meldet die gewöhnliche Neuberechnung (mit Text in self.errors)
+            return False
+        entry = getattr(trial, key).get(feature.name)
+        if entry is None:
+            return False
+        for state in [*self._before[index + 1:], self.state]:
+            getattr(state, key)[feature.name] = entry       # jeder Stand hat sein eigenes Verzeichnis (copy)
+        if self._end_state is not None:
+            getattr(self._end_state, key)[feature.name] = entry
+        return True
 
     def rename(self, index: int, name: str) -> None:
         """Benennt einen Schritt um (z. B. eine Skizze) und führt alle Verweise späterer Schritte mit.
@@ -310,7 +417,8 @@ class Timeline:
                 if start_values.is_neutral(feature):
                     # gerade gestartetes Werkzeug, noch bei 0 (bzw. neutral): ändert nichts, meldet keinen Fehler
                     continue
-                problem = self._trial(index, feature, state)
+                self._trial_result = None
+                problem = self._trial(index, feature, state, level)
                 if problem:
                     self.errors[index] = problem        # der Kern wäre hier abgestürzt oder hängen geblieben
                     continue
@@ -318,7 +426,10 @@ class Timeline:
                 if level >= 2:
                     _features.set_keep_edges(bodies_before.values())
                 try:
-                    feature.apply(state)
+                    # Runde 93: hat der Probelauf sein Ergebnis mitgeschickt, wird es übernommen statt den
+                    # (riskanten, meist teuren) Schritt ein zweites Mal zu rechnen
+                    if not _unpack_trial(self._trial_result, feature, state):
+                        feature.apply(state)
                     if level >= 2:
                         self._heal_changed(feature, state, bodies_before)
                 finally:
@@ -374,7 +485,7 @@ class Timeline:
             raise FeatureError(f"{feature.KIND} ergibt keinen gültigen Körper ({', '.join(broken)}) – "
                                "der Schritt wurde nicht ausgeführt; bitte andere Werte oder Auswahl versuchen")
 
-    def _trial(self, index: int, feature: Feature, state: BuildState) -> str:
+    def _trial(self, index: int, feature: Feature, state: BuildState, level: int = 0) -> str:
         """Probelauf eines riskanten Schritts im Kindprozess; eine Meldung, wenn er abstürzt oder hängt, sonst "".
 
         Harmlose Schritte (Skizzen, Ebenen, Verschieben, Farben …) und bereits bestandene Kombinationen aus
@@ -395,7 +506,24 @@ class Timeline:
             # Derselbe Schritt mit derselben Vorgeschichte ist schon einmal abgestürzt oder hängen geblieben:
             # nicht bei jeder Neuberechnung erneut bis zur Zeitgrenze warten
             return self._failed[key]
-        status, value = guard.run(lambda: feature.apply(state.copy()))
+        def work():
+            # genau wie die echte Rechnung (recompute): Kanten behalten ab Stufe 2, dann anwenden
+            from . import features as _features
+            trial = state.copy()
+            if level >= 2:
+                _features.set_keep_edges(trial.bodies.values())
+            try:
+                feature.apply(trial)
+            except FeatureError as error:
+                # Fehler des Schritts mitschicken: der Elternprozess meldet ihn, ohne den Schritt nachzurechnen
+                return {"error": str(error), "feature_error": True}
+            except Exception as error:      # unerwarteter Fehler des Geometriekerns
+                return {"error": str(error), "feature_error": False}
+            return _pack_trial(state, trial, feature)
+
+        status, value = guard.run(work, want_result=True)
+        if status == guard.OK:
+            self._trial_result = value          # Ergebnis zum Übernehmen (None: nicht übertragbar)
         if status == guard.CRASH:
             message = ("Der Geometriekern ist bei diesem Schritt abgestürzt (abgefangen) – "
                        "bitte andere Werte oder eine andere Auswahl versuchen")

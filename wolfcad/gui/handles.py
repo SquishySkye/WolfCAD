@@ -23,6 +23,10 @@ from OCP.TopoDS import TopoDS
 from ..core import features as ft
 from ..core import more_tools as mt
 from ..core import sketch, solids
+from ..core import extras as ex
+from ..core import gears as gr
+from ..core import sheetmetal as sm
+from ..core import surfaces as sf
 
 Vector = tuple[float, float, float]
 
@@ -53,6 +57,8 @@ class Handle:
     # Teil des Verschiebe-Kreuzes wie in Fusion (Runde 82): in der eigenen Achsfarbe gezeichnet (statt im
     # einheitlichen Blau), Pfeile mit kräftigem Schaft ab der Körpermitte, Drehgriffe als Ringstück mit Knauf
     gizmo: bool = False
+    # in der eigenen Farbe `color` statt im einheitlichen Blau (Auswahlsätze der Rundung/Fase, Runde 92)
+    tinted: bool = False
 
     def tip(self) -> Vector:
         if self.kind == ANGLE:
@@ -128,6 +134,9 @@ def _volume_centre(shape) -> Vector:
 
 _COUNT_STEP = 10.0      # mm Zugweg je Kopie am Anzahl-Griff des Kreismusters
 RED, GREEN, BLUE = (0.95, 0.32, 0.32), (0.40, 0.85, 0.42), (0.36, 0.62, 1.00)
+# Farben der abgeschlossenen Auswahlsätze einer Rundung/Fase (Pfeil und Kanten gleich gefärbt, Runde 92); der
+# gerade bearbeitete Satz behält die gewohnten Farben (blauer Pfeil, gelbe Kanten)
+SET_COLORS = ((0.35, 0.85, 0.55), (0.85, 0.50, 0.95), (0.30, 0.80, 0.95), (0.95, 0.55, 0.35))
 _AXIS_COLORS = {"X": RED, "Y": GREEN, "Z": BLUE}
 _MOVE_LEAD = 0.06       # Abstand der Verschiebe-Griffe vom Körpermittelpunkt (Anteil der Kameraentfernung)
 
@@ -236,6 +245,220 @@ def _canvas_handles(feature) -> list:
     ]
 
 
+def _edge_arrow(body, edge, position: float = 0.5):
+    """(Fußpunkt, Richtung) eines Pfeils an der Stelle `position` (0 … 1) der Kante, ins Körperinnere und
+    senkrecht zur Kante – wie die Pfeile der Rundung in Fusion. None, wenn keine Richtung bestimmbar ist."""
+    curve = BRepAdaptor_Curve(edge)
+    point, tangent = gp_Pnt(), gp_Vec()
+    curve.D1(curve.FirstParameter() + (curve.LastParameter() - curve.FirstParameter()) * position, point, tangent)
+    inward = gp_Vec(point, gp_Pnt(*_volume_centre(body)))
+    if tangent.Magnitude() > 1e-12:
+        tangent.Normalize()
+        inward = inward - tangent * inward.Dot(tangent)
+    direction = _unit(_xyz(inward))
+    return None if direction is None else (_xyz(point), direction)
+
+
+def _edge_tool_handles(feature, before) -> list | None:
+    """Pfeile der Rundung/Fase (Runde 92, wie Fusion): einer für den gerade bearbeiteten Satz, je abgeschlossenem
+    Satz einer in dessen Farbe (Parameter „sets.<Nummer>“) und beim variablen Radius je einer am Ende und am
+    Zwischenpunkt der Kante."""
+    name = ft.select_bodies(before, feature.body)[0]
+    body = before.bodies[name]
+    edges = ft.unique_edges(body)
+    size = "radius" if isinstance(feature, ft.Fillet) else "distance"
+    found = []
+    if feature.edge_points:
+        edge = ft.find_by_points(edges, ft.edge_point, feature.edge_points[:1], "Kante")[0]
+    elif not feature.sets:
+        edge = ft._sharp_edges(body)[0]
+    else:
+        edge = None             # nach „+“: der neue Satz bekommt seinen Pfeil erst mit der ersten Kante
+    if edge is not None:
+        arrow = _edge_arrow(body, edge)
+        if arrow is not None:
+            found.append(Handle(*arrow, size, getattr(feature, size), minimum=0.05))
+        variable = isinstance(feature, ft.Fillet) and feature.radius_type == ft.RADIUS_KINDS[2]
+        if variable and feature.fillet_type == ft.FILLET_KINDS[0]:
+            # Radius am Ende (Anfang ist der Hauptpfeil, hier in die Kantenmitte gerückt) und am Zwischenpunkt
+            for parameter, position in (("radius2", 0.97),
+                                        ("mid_radius", min(max(feature.mid_position, 0.05), 0.95))):
+                arrow = _edge_arrow(body, edge, position)
+                if arrow is not None:
+                    found.append(Handle(*arrow, parameter, getattr(feature, parameter), minimum=0.0))
+            start = _edge_arrow(body, edge, 0.03)
+            if start is not None and found:
+                found[0] = Handle(*start, size, getattr(feature, size), minimum=0.05)
+    for number, entry in enumerate(feature.sets):
+        try:
+            first = ft.find_by_points(edges, ft.edge_point, entry["edge_points"][:1], "Kante")[0]
+        except (ft.FeatureError, KeyError, IndexError):
+            continue
+        arrow = _edge_arrow(body, first)
+        if arrow is not None:
+            found.append(Handle(*arrow, f"sets.{number}", float(entry.get(size, 0.0)), minimum=0.05,
+                                color=SET_COLORS[number % len(SET_COLORS)], tinted=True))
+    return found or None
+
+
+_SCALE_LENGTH = 20.0        # Skalieren: so viele mm am Pfeil entsprechen dem Faktor 1
+
+
+def _sketch_place(state, name: str):
+    """(Mitte, Normale) einer Skizze: Mitte ihres Profils bzw. ihrer Kurven, Normale ihrer Ebene."""
+    if name not in state.frames:
+        return None
+    normal = _xyz(state.frames[name].Direction())
+    if name in state.profiles:
+        return _surface_centre(state.profiles[name]), normal
+    if name in getattr(state, "curves", {}):
+        return _surface_centre_of_curves(state.curves[name]), normal
+    return _xyz(state.frames[name].Location()), normal
+
+
+def _across(direction: Vector) -> Vector:
+    """Eine Richtung senkrecht zu `direction` (bevorzugt waagrecht)."""
+    helper = (0.0, 0.0, 1.0) if abs(direction[2]) < 0.9 else (1.0, 0.0, 0.0)
+    cross = (direction[1] * helper[2] - direction[2] * helper[1], direction[2] * helper[0] - direction[0] * helper[2],
+             direction[0] * helper[1] - direction[1] * helper[0])
+    return _unit(cross) or (1.0, 0.0, 0.0)
+
+
+def _gear_handles(feature) -> list[Handle]:
+    """Zahnrad (Runde 97): Pfeil längs der Achse für die Zahnbreite, Pfeil nach außen für die Zähnezahl (sein Wert
+    ist der Teilkreisradius m·z/2 – so wächst das Rad beim Ziehen sichtbar mit). Zahnstange: Länge in x-Richtung."""
+    frame = ex._frame(feature.plane, feature.center_x, feature.center_y, feature.center_z)
+    centre, x_dir, normal = _xyz(frame.Location()), _xyz(frame.XDirection()), _xyz(frame.Direction())
+    found = [Handle(centre, normal, "thickness", feature.thickness, minimum=0.0)]
+    if feature.module > 1e-9:
+        if feature.gear_type == "Zahnstange":
+            # Länge der Zahnstange = Zähne × Teilung π·m
+            pitch = math.pi * feature.module
+            found.append(Handle(centre, x_dir, "teeth", feature.tooth_count() * pitch, factor=1.0 / pitch,
+                                minimum=pitch, unit=" Z.", color=_SCALE_COLOR))
+        else:
+            found.append(Handle(centre, x_dir, "teeth", feature.pitch_diameter() / 2, factor=2.0 / feature.module,
+                                minimum=1.5 * feature.module, unit=" Z.", color=_SCALE_COLOR))
+    return found
+
+
+def _more_handles(feature, before):
+    """Pfeile der Werkzeuge, die bis Runde 92 keine hatten (Runde 93, wie in Fusion): Torus, Spule, Rohr,
+    Prägen, Steg, Skalieren, Fläche extrudieren/versetzen, Aufdicken, Flansch an Kante, Saum, Ebene entlang Pfad.
+    None, wenn das Feature nicht dazugehört."""
+    if isinstance(feature, gr.Gear):
+        return _gear_handles(feature)
+    if isinstance(feature, (ex.Torus, ex.Coil)):
+        frame = ex._frame(feature.plane, feature.center_x, feature.center_y, feature.center_z)
+        centre, x_dir, normal = _xyz(frame.Location()), _xyz(frame.XDirection()), _xyz(frame.Direction())
+        ring = tuple(c + x * feature.diameter / 2 for c, x in zip(centre, x_dir))
+        found = [Handle(centre, x_dir, "diameter", feature.diameter / 2, factor=2.0, minimum=0.5)]
+        if isinstance(feature, ex.Torus):
+            # Querschnitt: Pfeil am Ring nach oben (halber Querschnitt)
+            found.append(Handle(ring, normal, "section", feature.tube() / 2, factor=2.0, minimum=0.1,
+                                color=_SCALE_COLOR))
+        elif feature.pitch > 1e-9:
+            # Höhe der Spule längs der Achse: Windungen × Steigung
+            found.append(Handle(centre, normal, "turns", feature.turns * feature.pitch, factor=1.0 / feature.pitch,
+                                minimum=feature.pitch * 0.25, unit=" Wdg.", color=_SCALE_COLOR))
+        return found
+    if isinstance(feature, ex.Pipe):
+        from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+        try:
+            curve = BRepAdaptor_CompCurve(TopoDS.Wire(solids._path_wire(before, feature.path)))
+        except Exception:
+            return []
+        point, tangent = gp_Pnt(), gp_Vec()
+        curve.D1(curve.FirstParameter(), point, tangent)
+        direction = _unit(_xyz(tangent)) or (0.0, 0.0, 1.0)
+        return [Handle(_xyz(point), _across(direction), "diameter", feature.diameter / 2, factor=2.0, minimum=0.1)]
+    if isinstance(feature, (mt.Emboss, mt.Web, sf.SurfaceExtrude)):
+        place = _sketch_place(before, feature.sketch)
+        if place is None:
+            return []
+        centre, normal = place
+        if isinstance(feature, mt.Emboss):
+            inward = feature.mode == mt.EMBOSS_MODES[1]
+            direction = tuple(-c for c in normal) if inward else normal
+            return [Handle(centre, direction, "depth", feature.depth, minimum=0.05)]
+        if isinstance(feature, mt.Web):
+            # Steg: Dicke symmetrisch zur Skizzenebene
+            return [Handle(centre, normal, "thickness", feature.thickness / 2, factor=2.0, minimum=0.05)]
+        return [Handle(centre, normal, "distance", feature.distance)]
+    if isinstance(feature, solids.ScaleBody):
+        names = ft.select_bodies(before, feature.body)
+        if not names:
+            return []
+        if feature.reference == solids.SCALE_REFERENCES[0]:
+            bounds = solids._bounds(before.bodies[names[0]])
+            pivot = tuple((bounds[i] + bounds[i + 3]) / 2 for i in range(3))
+        else:
+            pivot = (0.0, 0.0, 0.0)
+        return [Handle(pivot, _DIAGONAL, "factor", feature.factor * _SCALE_LENGTH, factor=1.0 / _SCALE_LENGTH,
+                       minimum=0.05 * _SCALE_LENGTH, unit=" ×", color=_SCALE_COLOR)]
+    if isinstance(feature, (sf.OffsetSurface, sf.Thicken)):
+        if feature.surface not in before.surfaces:
+            return []
+        faces = ft.faces_of(before.surfaces[feature.surface])
+        if not faces:
+            return []
+        point, normal = solids.face_middle(faces[0])
+        if feature.flip:
+            normal = tuple(-c for c in normal)
+        size = "distance" if isinstance(feature, sf.OffsetSurface) else "thickness"
+        return [Handle(point, normal, size, getattr(feature, size), minimum=0.01)]
+    if isinstance(feature, (sm.EdgeFlange, ex.Hem)):
+        if not feature.edge_points:
+            return []
+        name = ft.select_bodies(before, feature.body)[0]
+        body = before.bodies[name]
+        edge = ft.find_by_points(ft.unique_edges(body), ft.edge_point, feature.edge_points[:1], "Kante")[0]
+        frame = ft._edge_frame(body, edge)
+        if frame is None:
+            return []
+        # Richtung des Flanschs: längs der Normale der größeren Nachbarfläche (die Blechseite), wie die Biegung
+        middle, _tangent, face_a, face_b, normal_a, normal_b = frame
+        area = lambda face: (lambda p: (BRepGProp.SurfaceProperties_s(face, p), p.Mass())[1])(GProp_GProps())
+        normal = normal_a if area(face_a) >= area(face_b) else normal_b
+        direction = _xyz(normal.Reversed() if feature.flip else normal)
+        return [Handle(_xyz(middle), _unit(direction) or (0.0, 0.0, 1.0), "length", feature.length, minimum=0.1)]
+    if isinstance(feature, ex.SplitFace) and feature.face_points and feature.plane in ft.PLANES:
+        # Fläche teilen: Pfeil längs der Normale der Teilungsebene, Wert = ihr Versatz
+        normal = ft.PLANES[feature.plane][0]
+        point = feature.face_points[0][:3]
+        along = sum(p * n for p, n in zip(point, normal))
+        base = tuple(p - n * along for p, n in zip(point, normal))
+        return [Handle(base, tuple(float(n) for n in normal), "offset", feature.offset)]
+    if isinstance(feature, solids.PathPattern):
+        from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+        try:
+            curve = BRepAdaptor_CompCurve(TopoDS.Wire(solids._path_wire(before, feature.path)))
+        except Exception:
+            return []
+        point, tangent = gp_Pnt(), gp_Vec()
+        curve.D1(curve.FirstParameter(), point, tangent)
+        direction = _unit(_xyz(tangent)) or (1.0, 0.0, 0.0)
+        # Anzahl wie beim Kreismuster: je 10 mm Zug eine Kopie mehr
+        return [Handle(_xyz(point), direction, "count", max(2, round(feature.count)) * _COUNT_STEP,
+                       factor=1.0 / _COUNT_STEP, minimum=2 * _COUNT_STEP, unit=" ×")]
+    if isinstance(feature, mt.PlaneAlongPath):
+        from OCP.BRepAdaptor import BRepAdaptor_CompCurve
+        from OCP.GCPnts import GCPnts_AbscissaPoint
+        try:
+            curve = BRepAdaptor_CompCurve(TopoDS.Wire(solids._path_wire(before, feature.path)))
+        except Exception:
+            return []
+        length = GCPnts_AbscissaPoint.Length_s(curve)
+        if length < 1e-9:
+            return []
+        point, tangent = gp_Pnt(), gp_Vec()
+        curve.D1(curve.FirstParameter(), point, tangent)
+        direction = _unit(_xyz(tangent)) or (1.0, 0.0, 0.0)
+        return [Handle(_xyz(point), direction, "position", feature.position * length, factor=1.0 / length,
+                       minimum=0.0, maximum=length, unit=" (Anteil)")]
+    return None
+
+
 def _handles(feature, before, after):
     if isinstance(feature, ft.Extrude):
         try:
@@ -303,6 +526,20 @@ def _handles(feature, before, after):
         # Fläche verschieben: drei Achsenpfeile an der Mitte der gewählten Flächen, dazu der Drehbogen
         base = tuple(sum(p[i] for p in feature.face_points) / len(feature.face_points) for i in range(3))
         found = _move_arrows(base, feature)
+        # Hauptpfeil (der erste, mit Wertfeld) ist wie in Fusion der längs der Flächennormale: eine Deckfläche
+        # zieht man nach oben, nicht seitlich in ihrer Ebene (Runde 93, das gab sonst gleich eine Fehlermeldung)
+        try:
+            name = ft.select_bodies(before, feature.body)[0]
+            face = ft.find_by_points(ft.faces_of(before.bodies[name]), ft.face_point, feature.face_points[:1],
+                                     "Fläche")[0]
+            frame = sketch.face_frame(face)
+        except (ft.FeatureError, IndexError, KeyError):
+            frame = None
+        if frame is not None:
+            normal = frame[3:6]
+            linear = [h for h in found if h.kind == LINEAR]
+            linear.sort(key=lambda h: -abs(sum(a * b for a, b in zip(h.direction, normal))))
+            found = linear + [h for h in found if h.kind != LINEAR]
         if feature.rotate_axis in solids.AXES:
             # der Bogen beginnt seitlich der Mitte, quer zur Drehachse
             axis = solids.AXES[feature.rotate_axis]
@@ -394,26 +631,14 @@ def _handles(feature, before, after):
         normal = ft.PLANES[feature.plane][0]
         return Handle((0.0, 0.0, 0.0), tuple(float(c) for c in normal), "offset", feature.offset)
 
+    if isinstance(feature, ft.Fillet) and feature.fillet_type == ft.FILLET_KINDS[2]:
+        return None         # volle Rundung: der Radius folgt aus dem Abstand der Seitenflächen
     if isinstance(feature, (ft.Fillet, ft.Chamfer)):
-        name = ft.select_bodies(before, feature.body)[0]
-        body = before.bodies[name]
-        if feature.edge_points:
-            edge = ft.find_by_points(ft.unique_edges(body), ft.edge_point, feature.edge_points[:1], "Kante")[0]
-        else:
-            edge = ft._sharp_edges(body)[0]
-        curve = BRepAdaptor_Curve(edge)
-        middle, tangent = gp_Pnt(), gp_Vec()
-        curve.D1((curve.FirstParameter() + curve.LastParameter()) / 2, middle, tangent)
-        # Richtung: von der Kante ins Körperinnere, senkrecht zur Kante
-        inward = gp_Vec(middle, gp_Pnt(*_volume_centre(body)))
-        if tangent.Magnitude() > 1e-12:
-            tangent.Normalize()
-            inward = inward - tangent * inward.Dot(tangent)
-        direction = _unit(_xyz(inward))
-        if direction is None:
-            return None
-        parameter = "radius" if isinstance(feature, ft.Fillet) else "distance"
-        return Handle(_xyz(middle), direction, parameter, getattr(feature, parameter), minimum=0.05)
+        return _edge_tool_handles(feature, before)
+
+    more = _more_handles(feature, before)
+    if more is not None:
+        return more
 
     if isinstance(feature, solids.PressPull):
         # Pfeil auf der gewählten Fläche längs ihrer Normale: heraus ziehen (+) oder hinein drücken (−)

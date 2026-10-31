@@ -33,12 +33,17 @@ Voraussetzungen: 64-Bit-System, Grafik mit OpenGL 3.3, unter Linux glibc ≥ 2.2
 - **Skizzen** mit Abhängigkeiten und Bemaßungen; DXF/SVG einfügen.
 - **Volumenkörper:** Extrusion, Drehen, Sweep, Erhebung, Rippe, Steg, Bohrung, Gewinde, Abrunden, Fase, Schale,
   Schräge, Drücken/Ziehen, Teilen, Kombinieren, Muster, Spiegeln, Skalieren, Verschieben, Torus, Spule, Rohr und mehr.
+- **Zahnräder:** Evolventenverzahnung aus Modul, Zähnezahl und Eingriffswinkel – Stirnrad, schräg- und
+  pfeilverzahnt, Hohlrad und Zahnstange, mit Bohrung und Flankenspiel.
+- **Formen (Sculpting):** Netze mit Pinseln wie in Blender formen (Zeichnen, Greifen, Glätten, Maske, Symmetrie,
+  Neu vernetzen, dynamische Topologie).
 - **Flächen, Blech und Netze:** Flächenwerkzeuge, Blech mit Abwicklung und Zuschnitt (DXF), Netze reparieren,
   glätten, schneiden und in Volumenkörper umwandeln.
 - **Baugruppen:** Komponenten, Gelenke, starre Gruppen, Kollisionsprüfung.
-- **Import/Export:** STEP und STL. `.f3d`-Dateien lassen sich importieren; übernommen werden die gespeicherten Körper.
+- **Import/Export:** STEP und STL; Netze auch aus OBJ und 3MF, mehrere Dateien auf einmal. `.f3d`-Dateien lassen sich importieren; übernommen werden die gespeicherten Körper.
 - **3D-Druck:** eigener Arbeitsbereich mit Druckbett, „Auf Fläche legen“, Profilen für Drucker, Filament und
-  Prozess. Geslict wird mit dem mitgelieferten Creality Print. Das Hochladen an Drucker mit Moonraker zeigt den
+  Prozess. Objekte am Pfeil verschieben und an Ringen drehen; mehrere Modelle (STL, OBJ, 3MF, STEP) auf einmal
+  laden oder hereinziehen. Vorschau der Druckbahnen als Körper mit Ablauf-Regler. Geslict wird mit dem mitgelieferten Creality Print. Das Hochladen an Drucker mit Moonraker zeigt den
   Fortschritt an.
 - **Physik-Tests:**
   - Festigkeit: statische FEM mit TET10-Elementen über gmsh und scipy.

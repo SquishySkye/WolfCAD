@@ -22,10 +22,15 @@ from PySide6.QtWidgets import QDoubleSpinBox, QLabel, QRubberBand
 
 from ..core import parameters as pm
 from . import theme
+from .handles import SET_COLORS     # Farben der Auswahlsätze (Kanten wie ihr Pfeil)
 from .parameters_ui import ExpressionBox
 
 # Benötigte OpenGL-Konstanten (PySide6 bringt dafür keine Namen mit)
 GL_LINES, GL_TRIANGLES = 0x0001, 0x0004
+_GL_UNSIGNED_INT = 0x1405
+# Versatz 0 in den gebundenen Indexpuffer: PySide verlangt hier einen Zeiger statt einer Zahl
+import shiboken6 as _shiboken
+_NO_OFFSET = _shiboken.VoidPtr(0)
 GL_DEPTH_TEST, GL_FLOAT = 0x0B71, 0x1406
 GL_COLOR_BUFFER_BIT, GL_DEPTH_BUFFER_BIT = 0x4000, 0x0100
 GL_POLYGON_OFFSET_FILL = 0x8037
@@ -119,6 +124,36 @@ void main() {
 }
 """
 
+# Glatt schattierte Ebenen (Runde 94, Formen wie in Blender): Normale je Eckpunkt statt aus den Bildschirmableitungen
+# – die Oberfläche wirkt rund statt facettiert
+_SMOOTH_VERTEX_SHADER = """#version 330 core
+layout(location = 0) in vec3 position;
+layout(location = 1) in vec3 normal;
+uniform mat4 model_view;
+uniform mat4 projection;
+uniform vec4 clip_plane;
+out vec3 view_normal;
+void main() {
+    vec4 in_view = model_view * vec4(position, 1.0);
+    view_normal = mat3(model_view) * normal;
+    gl_Position = projection * in_view;
+    gl_ClipDistance[0] = dot(vec4(position, 1.0), clip_plane);
+}
+"""
+_SMOOTH_FRAGMENT_SHADER = """#version 330 core
+in vec3 view_normal;
+uniform vec3 color;
+uniform bool lit;
+out vec4 result;
+void main() {
+    vec3 normal = normalize(view_normal);
+    float diffuse = abs(dot(normal, normalize(vec3(0.45, 0.8, 0.4))));
+    // etwas Glanzlicht wie Blenders Formen-Ansicht (Matcap-ähnlich): Form und Dellen lesen sich besser
+    float rim = pow(1.0 - abs(normal.z), 2.0);
+    result = vec4(color * (0.38 + 0.55 * diffuse) + vec3(0.10) * rim, 1.0);
+}
+"""
+
 # Leinwand (Bild als Vorlage auf einer Ebene): Eckpunkt mit Bildkoordinate, Bild halbdurchsichtig
 _CANVAS_VERTEX_SHADER = """#version 330 core
 layout(location = 0) in vec3 position;
@@ -197,6 +232,12 @@ class _Layer:
         self.mode, self.color, self.lit, self.line_width = mode, color, lit, line_width
         self.on_top = on_top    # ohne Tiefentest zeichnen: bleibt sichtbar, auch wenn es im Körper liegt
         self.alpha = 1.0        # Deckkraft; unter 1 scheint durch, was dahinter liegt
+        self.normals = None     # Normalen je Eckpunkt (glatt schattiert, siehe _SMOOTH_*); None: flach
+        # Indiziert gezeichnet (Runde 94, Formen): `data` sind dann die gemeinsamen Ecken, `indices` die Dreiecke als
+        # Eckennummern. Beim Formen ändern sich nur die Ecken – die Nummern werden nur bei neuer Topologie übertragen
+        self.indices = None
+        self.index_buffer = None
+        self.indices_dirty = False
         self.vao = QOpenGLVertexArrayObject()
         self.buffer = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
         self.count = 0
@@ -293,6 +334,14 @@ class Viewport(QOpenGLWidget):
             # im Modell angeklickte Skizzenprofile (vor der Extrusion)
             "selected_profiles": _Layer(GL_TRIANGLES, (0.25, 0.60, 1.00), True),
             "selected_edges": _Layer(GL_LINES, (1.00, 0.85, 0.20), False, line_width=4.0),
+            # Formen-Modus (Runde 94): das Netz beim Formen in Tonfarbe, geschützte (maskierte) Bereiche dunkel
+            # darüber, der Pinselkreis über allem
+            "sculpt_mesh": _Layer(GL_TRIANGLES, (0.78, 0.70, 0.62), True),
+            "sculpt_mask": _Layer(GL_TRIANGLES, (0.10, 0.10, 0.12), False),
+            "sculpt_brush": _Layer(GL_LINES, (1.00, 1.00, 1.00), False, line_width=2.0, on_top=True),
+            # Kanten der abgeschlossenen Auswahlsätze einer Rundung/Fase, je Satz in der Farbe seines Pfeils
+            **{f"set_edges{number}": _Layer(GL_LINES, colour, False, line_width=4.0)
+               for number, colour in enumerate(SET_COLORS)},
             # Skizzieren in der Ansicht: Raster, Zeichenhilfe, Vorschau des laufenden Elements, Fangmarke
             "construction_model": _Layer(GL_LINES, (0.72, 0.50, 0.22), False, line_width=1.2),
             "planes": _Layer(GL_LINES, (0.95, 0.62, 0.20), False, line_width=1.5),
@@ -421,10 +470,26 @@ class Viewport(QOpenGLWidget):
 
     # --- Daten ------------------------------------------------------------
 
-    def set_geometry(self, name: str, vertices: np.ndarray) -> None:
-        """Ersetzt die Eckpunkte einer Ebene; hochgeladen wird beim nächsten Zeichnen."""
+    def set_geometry(self, name: str, vertices: np.ndarray, normals: np.ndarray | None = None) -> None:
+        """Ersetzt die Eckpunkte einer Ebene; hochgeladen wird beim nächsten Zeichnen. Mit `normals` (je Eckpunkt)
+        wird die Ebene glatt schattiert."""
         layer = self._layers[name]
         layer.data = np.ascontiguousarray(vertices, dtype=np.float32)
+        layer.normals = None if normals is None or len(normals) != len(layer.data) else \
+            np.ascontiguousarray(normals, dtype=np.float32)
+        layer.indices = None            # lose Dreiecke (nicht indiziert)
+        layer.dirty = True
+        self.update()
+
+    def set_indexed(self, name: str, vertices: np.ndarray, normals: np.ndarray, indices: np.ndarray | None) -> None:
+        """Ebene aus gemeinsamen Ecken (mit Normalen, glatt schattiert) und Dreiecken als Eckennummern. `indices`
+        None: die bisherigen Dreiecke bleiben (nur die Ecken haben sich bewegt – das Übliche beim Formen)."""
+        layer = self._layers[name]
+        layer.data = np.ascontiguousarray(vertices, dtype=np.float32)
+        layer.normals = np.ascontiguousarray(normals, dtype=np.float32)
+        if indices is not None:
+            layer.indices = np.ascontiguousarray(indices, dtype=np.uint32).ravel()
+            layer.indices_dirty = True
         layer.dirty = True
         self.update()
 
@@ -740,7 +805,12 @@ class Viewport(QOpenGLWidget):
                 edited(initial_text)            # die erste Ziffer gilt schon
 
     def event(self, event) -> bool:
-        """Tab beim Zeichnen springt (wie Fusion) ins aktive Maßfeld, statt den Fokus weiterzugeben."""
+        """Tab beim Zeichnen springt (wie Fusion) ins aktive Maßfeld, statt den Fokus weiterzugeben. Eine Sitzung mit
+        eigenen Tasten (Formen: Blender-Tasten) beansprucht diese vor den fensterweiten Kürzeln."""
+        if (event.type() == QEvent.Type.ShortcutOverride and self.sketch_input is not None
+                and hasattr(self.sketch_input, "wants_key") and self.sketch_input.wants_key(event)):
+            event.accept()
+            return True
         if (event.type() == QEvent.Type.KeyPress and event.key() in (Qt.Key.Key_Tab, Qt.Key.Key_Backtab)
                 and self.sketch_input is not None and not self._number_box.isVisible()
                 and hasattr(self.sketch_input, "typed") and self.sketch_input.typed(None)):
@@ -764,6 +834,9 @@ class Viewport(QOpenGLWidget):
             finally:
                 self._forwarding_key = False
             return
+        if (self.sketch_input is not None and hasattr(self.sketch_input, "key_pressed")
+                and self.sketch_input.key_pressed(event)):
+            return                  # die Sitzung hat die Taste verarbeitet (Formen: Pinsel, Radius, Stärke …)
         text = event.text()
         # Ziffern beginnen ein Maß; "=" öffnet das Feld leer, um einen Ausdruck oder Parameternamen einzutippen
         if (self.sketch_input is not None and text and (text.isdigit() or text in ",.=")
@@ -1105,6 +1178,12 @@ class Viewport(QOpenGLWidget):
         self._line_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, _FRAGMENT_SHADER)
         if not self._line_program.link():
             raise RuntimeError(f"Linien-Shader konnten nicht gebunden werden: {self._line_program.log()}")
+        # Programm für glatt schattierte Ebenen (Normalen je Eckpunkt)
+        self._smooth_program = QOpenGLShaderProgram(self)
+        self._smooth_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, _SMOOTH_VERTEX_SHADER)
+        self._smooth_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Fragment, _SMOOTH_FRAGMENT_SHADER)
+        if not self._smooth_program.link():
+            raise RuntimeError(f"Glatt-Shader konnten nicht gebunden werden: {self._smooth_program.log()}")
         # Drittes Programm für die Leinwände (Bilder mit Textur)
         self._canvas_program = QOpenGLShaderProgram(self)
         self._canvas_program.addShaderFromSourceCode(QOpenGLShader.ShaderTypeBit.Vertex, _CANVAS_VERTEX_SHADER)
@@ -1118,19 +1197,40 @@ class Viewport(QOpenGLWidget):
         for layer in self._layers.values():
             layer.vao.create()
             layer.buffer.create()
-            # Nach einem Neuaufbau des OpenGL-Kontexts alles erneut hochladen
+            # Nach einem Neuaufbau des OpenGL-Kontexts alles erneut hochladen (auch die Eckennummern)
             layer.dirty = True
+            layer.index_buffer = None
 
     def _upload(self, layer: _Layer) -> None:
         layer.vao.bind()
         layer.buffer.bind()
         data = layer.data
-        layer.buffer.allocate(data.tobytes(), data.nbytes)
-        self._program.enableAttributeArray(0)
-        self._program.setAttributeBuffer(0, GL_FLOAT, 0, 3, 12)
+        if layer.indices is not None:
+            # Eckennummern der Dreiecke in einen eigenen Puffer, der zum VAO gehört (nur bei neuer Topologie)
+            if layer.index_buffer is None:
+                layer.index_buffer = QOpenGLBuffer(QOpenGLBuffer.Type.IndexBuffer)
+                layer.index_buffer.create()
+                layer.indices_dirty = True
+            layer.index_buffer.bind()
+            if layer.indices_dirty:
+                layer.index_buffer.allocate(layer.indices.tobytes(), layer.indices.nbytes)
+                layer.indices_dirty = False
+        if layer.normals is not None:
+            # Lage und Normale abwechselnd je Eckpunkt (6 Gleitkommazahlen)
+            both = np.ascontiguousarray(np.hstack([data, layer.normals]), dtype=np.float32)
+            layer.buffer.allocate(both.tobytes(), both.nbytes)
+            self._smooth_program.enableAttributeArray(0)
+            self._smooth_program.setAttributeBuffer(0, GL_FLOAT, 0, 3, 24)
+            self._smooth_program.enableAttributeArray(1)
+            self._smooth_program.setAttributeBuffer(1, GL_FLOAT, 12, 3, 24)
+        else:
+            layer.buffer.allocate(data.tobytes(), data.nbytes)
+            self._program.enableAttributeArray(0)
+            self._program.setAttributeBuffer(0, GL_FLOAT, 0, 3, 12)
+            self._program.disableAttributeArray(1)
         layer.vao.release()
         layer.buffer.release()
-        layer.count = len(data)
+        layer.count = len(layer.indices) if layer.indices is not None else len(data)
         layer.dirty = False
 
     def view_direction(self) -> tuple[float, float, float]:
@@ -1174,10 +1274,14 @@ class Viewport(QOpenGLWidget):
         view, projection = self._matrices()
         # Linien wachsen mit der Fensterhöhe, damit sie auf großen Bildschirmen sichtbar bleiben
         line_scale = max(1.0, self.height() / _LINE_SCALE_HEIGHT)
-        for program in (self._program, self._line_program):
+        for program in (self._program, self._smooth_program, self._line_program):
             program.bind()
             program.setUniformValue("model_view", view)
             program.setUniformValue("projection", projection)
+        # Uniforms gelten für das gerade gebundene Programm: das Linienprogramm muss hier gebunden sein. Seit Runde 94
+        # stand das Glatt-Programm zuletzt in der Schleife – die Linien bekamen keine Fenstergröße und verschwanden
+        # alle (Bodenraster, Achsen, Kanten), Runde 97
+        self._line_program.bind()
         self._line_program.setUniformValue("window_size", QVector2D(self.width(), self.height()))
         active = None
         # Farbige Körperflächen zuerst: was „obenauf“ gezeichnet wird (Griffe, Skizzen), muss danach kommen
@@ -1206,7 +1310,8 @@ class Viewport(QOpenGLWidget):
                 self._upload(layer)
             if not layer.count:
                 continue
-            program = self._line_program if layer.mode == GL_LINES else self._program
+            program = self._line_program if layer.mode == GL_LINES else \
+                self._smooth_program if layer.normals is not None else self._program
             if program is not active:
                 program.bind()
                 active = program
@@ -1228,7 +1333,10 @@ class Viewport(QOpenGLWidget):
                 gl.glEnable(GL_BLEND)
                 gl.glBlendColor(0.0, 0.0, 0.0, layer.alpha)
                 gl.glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA)
-            gl.glDrawArrays(layer.mode, 0, layer.count)
+            if layer.indices is not None:
+                gl.glDrawElements(layer.mode, layer.count, _GL_UNSIGNED_INT, _NO_OFFSET)
+            else:
+                gl.glDrawArrays(layer.mode, 0, layer.count)
             if layer.alpha < 1.0:
                 gl.glDisable(GL_BLEND)
             if layer.on_top:
@@ -1281,7 +1389,8 @@ class Viewport(QOpenGLWidget):
                 # alle Griffe im selben Blau wie in Fusion; die Achse zeigt die Richtung des Pfeils. Das
                 # Verschiebe-Kreuz zeigt wie Fusions Verschieben die Achsfarben (X rot, Y grün, Z blau)
                 handle = self._handles[index]
-                color = handle.color if getattr(handle, "gizmo", False) else theme.current().handle
+                color = handle.color if getattr(handle, "gizmo", False) or getattr(handle, "tinted", False) \
+                    else theme.current().handle
                 if index == self._hover or (self._handle_drag and index == self._active):
                     # Der Pfeil unter der Maus bzw. der gezogene leuchtet heller
                     color = tuple(min(1.0, c + 0.35) for c in color)
@@ -1640,7 +1749,9 @@ class Viewport(QOpenGLWidget):
         # Den Pfeil unter der Maus greifen (am Kopf oder irgendwo am Schaft)
         grabbed_index = self._handle_under(event.position())
         if event.button() == Qt.MouseButton.LeftButton and grabbed_index is not None:
-            self.set_handles(self._handles, active=grabbed_index)
+            # Anklicken wechselt nur den aktiven Pfeil; die Kamera bleibt, wo sie ist (bis Runde 89 wich sie hier
+            # zurück, sobald ein anderer Griff außerhalb des Bilds lag – die Ansicht sprang beim Klick)
+            self.set_handles(self._handles, active=grabbed_index, follow=False)
             self._handle_drag = True
             # Erst wenn die Maus sich bewegt, wird gezogen; ein Klick ohne Bewegung wählt wie in Fusion die
             # Fläche darunter (der Pfeil der Schale z. B. sitzt mitten auf der Fläche, die man öffnen will)
@@ -1685,7 +1796,7 @@ class Viewport(QOpenGLWidget):
             return
         if self._handle_drag:
             self._handle_drag = False
-            self.set_handles(self._handles)     # jetzt darf die Kamera nachrücken
+            self.set_handles(self._handles, follow=False)   # Kamera bleibt auch nach dem Loslassen stehen
             if getattr(self, "_handle_moved", False):
                 self.handle_released.emit()
             if not getattr(self, "_handle_moved", True) and event.button() == Qt.MouseButton.LeftButton:
