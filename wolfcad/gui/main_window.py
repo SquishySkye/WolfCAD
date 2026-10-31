@@ -255,7 +255,7 @@ _RIBBON_PLACES = {
     "Netz einfügen": [(MESH_TAB, "ERSTELLEN", True)], "Körper in Netz umwandeln": [(MESH_TAB, "ERSTELLEN", True)],
     "Netz in Körper umwandeln": [(MESH_TAB, "ÄNDERN", True)], "Netz verkleinern": [(MESH_TAB, "ÄNDERN", True)],
     "Netz reparieren": [(MESH_TAB, "ÄNDERN", True)], "Netz glätten": [(MESH_TAB, "ÄNDERN", True)],
-    "Formen": [(MESH_TAB, "ÄNDERN", True)],
+    "Formen": [(MESH_TAB, "ÄNDERN", True)], "Schleifenschnitt": [(MESH_TAB, "ÄNDERN", True)],
     "Netz als STL speichern": [(MESH_TAB, "AUSGABE", True)],
     "Extrusion": [(SOLID_TAB, "ERSTELLEN", True)], "Drehen": [(SOLID_TAB, "ERSTELLEN", True)],
     "Sweep": [(SOLID_TAB, "ERSTELLEN", False)], "Erhebung": [(SOLID_TAB, "ERSTELLEN", False)],
@@ -283,6 +283,7 @@ _RIBBON_PLACES = {
     "Abwickeln": [(SHEET_TAB, "ÄNDERN", True)], "Zurückbiegen": [(SHEET_TAB, "ÄNDERN", True)],
     "Biegen": [(SHEET_TAB, "ÄNDERN", True)],
     "3D-Druck": [(UTILITY_TAB, "AUSGABE", True), (MESH_TAB, "AUSGABE", True)],
+    "Schaltplan": [(UTILITY_TAB, "AUSGABE", True)],
     "Einpassen": [(UTILITY_TAB, "ANSICHT", True)], "Raster": [(UTILITY_TAB, "ANSICHT", True)],
     "Abspielen": [(UTILITY_TAB, "FUSION", True)], "Hilfskörper": [(UTILITY_TAB, "FUSION", True)],
     "Torus": [(SOLID_TAB, "ERSTELLEN", False)], "Spule": [(SOLID_TAB, "ERSTELLEN", False)],
@@ -1011,6 +1012,7 @@ class MainWindow(QMainWindow):
         self._documents.tabCloseRequested.connect(self._close_document_tab)
         self._documents.tabBar().setTabButton(0, self._documents.tabBar().ButtonPosition.RightSide, None)
         self._print_workspace = None
+        self._schematic_workspace = None    # Reiter „Schaltplan“ (Runde 98), entsteht beim ersten Öffnen
         self.setCentralWidget(self._documents)
 
         # Browser wie in Fusion: schwebend oben links auf der 3D-Ansicht
@@ -1259,6 +1261,9 @@ class MainWindow(QMainWindow):
                "Sichtbare Körper als STEP oder STL speichern (z. B. für den 3D-Druck)", where=top)
         action("3D-Druck", "print3d", lambda: self.open_print_workspace(False),
                "Druck-Reiter öffnen: Körper aufs Druckbett legen, slicen und an den Drucker senden", where=top)
+        action("Schaltplan", "schematic", self.open_schematic,
+               "Schaltplan-Reiter öffnen: Bauteile aus der Bibliothek setzen, Leitungen ziehen, prüfen (ERC), "
+               "Netzliste, Stückliste und SPICE ausgeben", where=top)
         top.addSeparator()
         action("Rückgängig", "undo", self._undo, shortcut=QKeySequence.StandardKey.Undo, where=top)
         action("Wiederholen", "redo", self._redo, shortcut=QKeySequence.StandardKey.Redo, where=top)
@@ -1400,6 +1405,9 @@ class MainWindow(QMainWindow):
         action("Formen", "sculpt", self._start_sculpt,
                "Formen (Sculpting) wie in Blender: Netz mit Pinseln modellieren – Zeichnen, Ton, Greifen, Glätten, "
                "Maske, Symmetrie (ein Volumenkörper wird dafür in ein Netz umgewandelt)")
+        action("Schleifenschnitt", "loop_cut", self._start_loop_cut,
+               "Neue Kantenschleife ins Netz setzen wie in Blender (Strg+R im Formen-Modus); startet bei Bedarf das "
+               "Formen am gewählten Körper")
         action("Netz glätten", "mesh_smooth", lambda: self._create(ms.MeshSmooth()),
                "Netz glätten (Rauschen und Treppen eines Scans), ohne dass es schrumpft")
         action("Netz schneiden", "mesh_plane_cut", lambda: self._create(ex.MeshPlaneCut()),
@@ -3833,8 +3841,12 @@ class MainWindow(QMainWindow):
             marking.close()         # ein offenes rundes Menü schließt zuerst
             return
         if self._sculpt is not None:
+            if self._sculpt.escape():
+                return                  # erst den Schleifenschnitt beenden (wie Blender), der Formen-Modus bleibt
             self._end_sculpt(False)     # Formen abbrechen: das Netz bleibt, wie es war
             return
+        if self._schematic_current() and self._schematic_workspace.escape():
+            return                  # im Schaltplan: Leitung/Werkzeug/Auswahl beenden
         workspace = getattr(self, "_print_workspace", None)
         if workspace is not None and self._documents.currentWidget() is workspace and workspace.escape():
             return                  # im Druck-Reiter: z. B. „Auf Fläche legen“ beenden
@@ -4720,10 +4732,19 @@ class MainWindow(QMainWindow):
 
     # --- Formen (Sculpting, Runde 94) -----------------------------------------------------------------------
 
-    def _start_sculpt(self, index: int | None = None) -> bool:
+    def _start_loop_cut(self) -> None:
+        """Schleifenschnitt aus dem Reiter NETZ: im laufenden Formen sofort, sonst das Formen starten und ihn wählen."""
+        if self._sculpt is not None:
+            self._sculpt.panel.loop_button.setChecked(True)
+            self.viewport.setFocus()
+        else:
+            self._start_sculpt(loop=True)
+
+    def _start_sculpt(self, index: int | None = None, loop: bool = False) -> bool:
         """Formen-Modus wie in Blender (siehe gui/sculpt_ui.py). Neu: am gewählten Netzkörper (ein gewählter
         Volumenkörper wird erst in ein feines Netz umgewandelt); ohne Auswahl wartet das Werkzeug auf einen Klick.
-        Mit `index`: einen vorhandenen Schritt „Formen“ weiterformen (Timeline bis dorthin zurückgerollt)."""
+        Mit `index`: einen vorhandenen Schritt „Formen“ weiterformen (Timeline bis dorthin zurückgerollt).
+        Mit `loop`: gleich mit dem Schleifenschnitt statt mit dem Pinsel beginnen."""
         self._finish_live(True)
         rolled = None
         if index is not None:
@@ -4746,7 +4767,7 @@ class MainWindow(QMainWindow):
                 meshes = list(state.meshes)
             if not meshes and not solids_:
                 self._await_picks("Formen", "Netzkörper oder Volumenkörper anklicken, der geformt werden soll.",
-                                  lambda: bool(self._selection) and self._start_sculpt())
+                                  lambda: bool(self._selection) and self._start_sculpt(loop=loop))
                 return False
             if meshes:
                 name = meshes[0]
@@ -4776,9 +4797,12 @@ class MainWindow(QMainWindow):
         self._panel_form.addWidget(session.panel)
         self.panel_dock.show()
         self.viewport.show_info("Formen: linke Maustaste formt, Strg umgekehrt, Umschalt glättet – Pinsel per Taste "
-                                "wie in Blender (X, C, I, G, S, P, M …). Eingabe/OK übernimmt, Esc bricht ab.")
+                                "wie in Blender (X, C, I, G, S, P, M …), Strg+R Schleifenschnitt. "
+                                "Eingabe/OK übernimmt, Esc bricht ab.")
         self._refresh()
         self.viewport.setFocus()
+        if loop:
+            session.panel.loop_button.setChecked(True)
         return True
 
     def _end_sculpt(self, accept: bool) -> None:
@@ -5245,7 +5269,9 @@ class MainWindow(QMainWindow):
         dialog = ParameterDialog(before, apply, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             # Abbrechen: der vor dem Öffnen gemerkte Entwurf kommt zurück (samt aller Ausdrücke)
+            schematic = self.timeline.schematic
             self.timeline = Timeline.from_document(self._undo_stack.pop())
+            self.timeline.schematic = schematic
             self._refresh()
 
     def _restore(self, source: list, target: list) -> None:
@@ -5253,13 +5279,21 @@ class MainWindow(QMainWindow):
         if not source:
             return
         target.append(self.timeline.to_document())
+        schematic = self.timeline.schematic
         self.timeline = Timeline.from_document(source.pop())
+        self.timeline.schematic = schematic     # Rückgängig im 3D-Entwurf lässt den Schaltplan stehen
         self._refresh()
 
     def _undo(self) -> None:
+        if self._schematic_current():
+            self._schematic_workspace.undo()        # im Schaltplan: dessen eigener Verlauf
+            return
         self._restore(self._undo_stack, self._redo_stack)
 
     def _redo(self) -> None:
+        if self._schematic_current():
+            self._schematic_workspace.redo()
+            return
         self._restore(self._redo_stack, self._undo_stack)
 
     def _create_extrude(self) -> None:
@@ -6156,6 +6190,7 @@ class MainWindow(QMainWindow):
             return False
         self._mesh_cache.clear()
         self.timeline = timeline
+        self._reload_schematic()
         self._path = Path(stored["pfad"]) if stored.get("pfad") else None
         self._hidden_bodies = set(self.timeline.view_state.get("hidden", []))
         self._saved_text = "wiederhergestellt"      # gilt als ungespeichert, bis der Nutzer speichert
@@ -6233,8 +6268,40 @@ class MainWindow(QMainWindow):
             if meshes:
                 self._print_workspace.add_meshes(meshes)
 
+    def open_schematic(self) -> None:
+        """Öffnet (oder zeigt) den Reiter „Schaltplan“ mit dem Schaltplan dieses Entwurfs."""
+        from .schematic_workspace import SchematicWorkspace
+        self._finish_live(True)
+        if self._schematic_workspace is None:
+            self._schematic_workspace = SchematicWorkspace()
+            self._schematic_workspace.load(self.timeline.schematic)
+            self._schematic_workspace.changed.connect(self._schematic_changed)
+            self._documents.addTab(self._schematic_workspace, icon("schematic"), "Schaltplan")
+        self._documents.setCurrentWidget(self._schematic_workspace)
+        self._schematic_workspace.canvas.setFocus()
+
+    def _schematic_current(self) -> bool:
+        return self._schematic_workspace is not None and self._documents.currentWidget() is self._schematic_workspace
+
+    def _schematic_changed(self) -> None:
+        """Jede Änderung im Schaltplan landet im Entwurf (Speichern, Nachfrage beim Schließen, Absturzsicherung)."""
+        data = self._schematic_workspace.data()
+        sheet_empty = not (data.get("bauteile") or data.get("leitungen") or data.get("labels") or data.get("titel"))
+        self.timeline.schematic = {} if sheet_empty else data
+
+    def _reload_schematic(self) -> None:
+        """Nach Neu/Öffnen/Wiederherstellen: ein offener Schaltplan-Reiter zeigt den Schaltplan des neuen Entwurfs."""
+        if self._schematic_workspace is not None:
+            self._schematic_workspace.load(self.timeline.schematic)
+
     def _close_document_tab(self, index: int) -> None:
         widget = self._documents.widget(index)
+        if widget is self._schematic_workspace:
+            # der Schaltplan bleibt im Entwurf (timeline.schematic); nur der Reiter schließt
+            self._documents.removeTab(index)
+            widget.deleteLater()
+            self._schematic_workspace = None
+            return
         if widget is self._print_workspace:
             self._print_workspace.shutdown()
             self._documents.removeTab(index)
@@ -6267,6 +6334,7 @@ class MainWindow(QMainWindow):
         self._undo_stack.clear()
         self._redo_stack.clear()
         self._mark_saved()
+        self._reload_schematic()
         self._refresh(fit=True)
 
     def _open(self) -> None:
@@ -6293,6 +6361,7 @@ class MainWindow(QMainWindow):
         self._path = Path(path)
         self._hidden_bodies = set(self.timeline.view_state.get("hidden", []))      # gespeicherte Sichtbarkeit
         self._mark_saved()
+        self._reload_schematic()
         self._refresh(fit=True)
 
     def _save(self) -> None:

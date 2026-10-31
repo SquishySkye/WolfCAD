@@ -339,6 +339,10 @@ class Viewport(QOpenGLWidget):
             "sculpt_mesh": _Layer(GL_TRIANGLES, (0.78, 0.70, 0.62), True),
             "sculpt_mask": _Layer(GL_TRIANGLES, (0.10, 0.10, 0.12), False),
             "sculpt_brush": _Layer(GL_LINES, (1.00, 1.00, 1.00), False, line_width=2.0, on_top=True),
+            # Formen (Runde 98): Netzansicht als Drahtgitter über dem Netz (wie Blenders Überlagerung „Drahtgitter“)
+            # und die gelbe Vorschau des Schleifenschnitts
+            "sculpt_wire": _Layer(GL_LINES, (0.08, 0.08, 0.10), False, line_width=0.8),
+            "sculpt_loop": _Layer(GL_LINES, (1.00, 0.82, 0.10), False, line_width=2.2),
             # Kanten der abgeschlossenen Auswahlsätze einer Rundung/Fase, je Satz in der Farbe seines Pfeils
             **{f"set_edges{number}": _Layer(GL_LINES, colour, False, line_width=4.0)
                for number, colour in enumerate(SET_COLORS)},
@@ -486,7 +490,8 @@ class Viewport(QOpenGLWidget):
         None: die bisherigen Dreiecke bleiben (nur die Ecken haben sich bewegt – das Übliche beim Formen)."""
         layer = self._layers[name]
         layer.data = np.ascontiguousarray(vertices, dtype=np.float32)
-        layer.normals = np.ascontiguousarray(normals, dtype=np.float32)
+        # ohne Normalen (Linien, z. B. das Drahtgitter beim Formen: `indices` sind dann Kanten als Eckenpaare)
+        layer.normals = None if normals is None else np.ascontiguousarray(normals, dtype=np.float32)
         if indices is not None:
             layer.indices = np.ascontiguousarray(indices, dtype=np.uint32).ravel()
             layer.indices_dirty = True
@@ -1368,6 +1373,9 @@ class Viewport(QOpenGLWidget):
         towards = 1.0 if sum(look.background) / 3 < 0.5 else 0.0
         for name, share in (("ground_grid", 0.10), ("ground_grid_major", 0.22)):
             self._layers[name].color = tuple(part + (towards - part) * share for part in look.background)
+        # Netz beim Formen und Importkörper: Grau bzw. leicht in der Farbe des Betriebssystems statt Braun
+        for name in ("sculpt_mesh", "import_faces"):
+            self._layers[name].color = theme.mesh_body_colour()
         if self._handles:
             self.set_handles(self._handles, follow=False)      # nur neu einfärben
         self.update()
@@ -1968,6 +1976,9 @@ class Viewport(QOpenGLWidget):
         (Streckung um diesen Punkt). Er bleibt dabei unter dem Zeiger, und die Kamera nähert sich der getroffenen
         Oberfläche nur an – bisher zoomte das Rad auf den Drehpunkt, der oft im Körper liegt; die Kamera fuhr dann
         durch die Oberfläche und das Bild sprang (Nutzermeldung Runde 83)."""
+        wheel = getattr(self.sketch_input, "wheel", None)
+        if wheel is not None and wheel(event.angleDelta().y()):
+            return          # die Sitzung nutzt das Rad selbst (Formen: Zahl der Schleifenschnitte wie in Blender)
         factor = math.pow(0.999, event.angleDelta().y())
         anchor = self._zoom_anchor(event.position())
         if anchor is not None:

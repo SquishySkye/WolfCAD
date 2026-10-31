@@ -301,30 +301,203 @@ class SculptMesh:
             added += len(chosen)
             is_split = np.isin(keys, chosen)
             middle = np.where(is_split, count + np.searchsorted(chosen, keys), -1)
-            splits = is_split.sum(axis=1)
-            pieces = [faces[splits == 0]]
-            # eine geteilte Kante k (p→q, Mitte m, gegenüber r): (p, m, r), (m, q, r)
-            one = np.nonzero(splits == 1)[0]
-            k = is_split[one].argmax(axis=1)
-            p_, q_, r_ = faces[one, k], faces[one, (k + 1) % 3], faces[one, (k + 2) % 3]
-            m_ = middle[one, k]
-            pieces += [np.stack([p_, m_, r_], 1), np.stack([m_, q_, r_], 1)]
-            # zwei geteilte Kanten: die ungeteilte u (a→b), dann b→c mit Mitte m1, c→a mit Mitte m2
-            two = np.nonzero(splits == 2)[0]
-            u = (~is_split[two]).argmax(axis=1)
-            a2, b2, c2 = faces[two, u], faces[two, (u + 1) % 3], faces[two, (u + 2) % 3]
-            m1, m2 = middle[two, (u + 1) % 3], middle[two, (u + 2) % 3]
-            pieces += [np.stack([a2, b2, m1], 1), np.stack([a2, m1, m2], 1), np.stack([m2, m1, c2], 1)]
-            # drei geteilte Kanten: vier Dreiecke wie beim Unterteilen
-            three = np.nonzero(splits == 3)[0]
-            a3, b3, c3 = faces[three, 0], faces[three, 1], faces[three, 2]
-            ab, bc, ca = middle[three, 0], middle[three, 1], middle[three, 2]
-            pieces += [np.stack([a3, ab, ca], 1), np.stack([ab, b3, bc], 1), np.stack([ca, bc, c3], 1),
-                       np.stack([ab, bc, ca], 1)]
-            faces = np.concatenate(pieces)
+            faces = _split_faces(faces, is_split, middle)
         if added:
             self.__init__(vertices, faces, mask)
         return added
+
+    # --- Schleifenschnitt (Runde 98, wie Blenders „Loop Cut“) -----------------------------------------------
+
+    def _edge_lookup(self):
+        """Kante → angrenzende Dreiecke: sortierte Kantenschlüssel (klein·V + groß) und das Dreieck je Eintrag.
+        Gemerkt je Topologie (beim Schleifenschnitt fragt jede Mausbewegung die Nachbarn einer Kante ab)."""
+        cached = getattr(self, "_edges_cache", None)
+        if cached is not None and cached[0] == self.topology:
+            return cached[1], cached[2]
+        count = len(self.vertices)
+        nxt = np.roll(self.faces, -1, axis=1)
+        keys = (np.minimum(self.faces, nxt) * count + np.maximum(self.faces, nxt)).ravel()
+        order = np.argsort(keys, kind="stable")
+        sorted_keys, owner = keys[order], order // 3
+        self._edges_cache = (self.topology, sorted_keys, owner)
+        return sorted_keys, owner
+
+    def faces_at_edge(self, a: int, b: int) -> np.ndarray:
+        """Die Dreiecke an der Kante a–b (eins am Rand, zwei im Inneren eines geschlossenen Netzes)."""
+        keys, owner = self._edge_lookup()
+        key = min(a, b) * len(self.vertices) + max(a, b)
+        low, high = np.searchsorted(keys, key, "left"), np.searchsorted(keys, key, "right")
+        return owner[low:high]
+
+    def _is_diagonal(self, a: int, b: int) -> bool:
+        """Liegt a–b als Diagonale in einem „Viereck“ aus zwei Dreiecken? (die längste Kante beider Dreiecke, die
+        fast in einer Ebene liegen). Blender schneidet Vierecke quer; ein Schnitt längs der Diagonale liefe schräg
+        durchs Netz – die Diagonale wird deshalb beim Zielen übersprungen (Netze aus Körpern sind Dreiecksnetze)."""
+        around = self.faces_at_edge(a, b)
+        if len(around) != 2:
+            return False
+        length = np.linalg.norm(self.vertices[a] - self.vertices[b])
+        for face in around:
+            corners = self.vertices[self.faces[face]]
+            sides = np.linalg.norm(corners - np.roll(corners, -1, axis=0), axis=1)
+            if length < sides.max() - 1e-9 * max(length, 1.0):
+                return False
+        n1, n2 = self.face_normals[around[0]], self.face_normals[around[1]]
+        cosine = float(n1 @ n2) / ((np.linalg.norm(n1) * np.linalg.norm(n2)) or 1.0)
+        return cosine > 0.98        # unter rund 11° Knick: ein ebenes Viereck
+
+    def loop_edge(self, point, face: int) -> tuple[int, int] | None:
+        """Die Kante, an der ein Schleifenschnitt bei `point` (auf dem Dreieck `face`) ansetzt: die nächste Kante des
+        getroffenen Dreiecks, Viereck-Diagonalen ausgenommen. Rückgabe (a, b) als Eckennummern."""
+        point = np.asarray(point, dtype=np.float64)
+        corners = self.faces[face]
+        candidates = []
+        for k in range(3):
+            a, b = int(corners[k]), int(corners[(k + 1) % 3])
+            p, q = self.vertices[a], self.vertices[b]
+            span = q - p
+            t = float(np.clip((point - p) @ span / ((span @ span) or 1.0), 0.0, 1.0))
+            candidates.append((float(np.linalg.norm(p + span * t - point)), a, b))
+        candidates.sort()
+        for _distance, a, b in candidates:
+            if not self._is_diagonal(a, b):
+                return a, b
+        return candidates[0][1], candidates[0][2]
+
+    @staticmethod
+    def loop_positions(count: int, slide: float = 0.0) -> np.ndarray:
+        """Wo `count` Schnitte die Ansatzkante teilen (0 … 1): gleichmäßig verteilt wie in Blender, mit `slide`
+        (−1 … 1) gemeinsam zur einen oder anderen Ecke geschoben – höchstens bis knapp vor die Ecke."""
+        count = max(1, int(count))
+        base = np.arange(1, count + 1) / (count + 1)
+        room = 0.95 / (count + 1)
+        return base + float(np.clip(slide, -1.0, 1.0)) * room
+
+    def _loop_cut_plane(self, point, normal):
+        """Die Dreiecke, die die Schnittebene (durch `point`, Normale `normal`) als zusammenhängende Schleife um die
+        Stelle `point` schneidet. Rückgabe (Abstände der Ecken zur Ebene, Vorzeichen, Dreiecke der Schleife,
+        geschnittene Kanten je Dreieck) oder None, wenn die Ebene dort nichts schneidet.
+
+        Ein Schnitt mit der Ebene statt Blenders Kantenring: Netze aus Körpern sind unregelmäßige Dreiecksnetze, in
+        denen es keine Viereck-Ringe gibt. Damit nicht jede Stelle durchschnitten wird, die die Ebene sonst noch
+        trifft (z. B. beide Arme eines U), gilt nur der zusammenhängende Ring, der an der Stelle beginnt."""
+        from scipy.sparse import coo_matrix
+        from scipy.sparse.csgraph import connected_components
+        point = np.asarray(point, dtype=np.float64)
+        normal = np.asarray(normal, dtype=np.float64)
+        normal = normal / (np.linalg.norm(normal) or 1.0)
+        scale = float(np.linalg.norm(self.vertices.max(axis=0) - self.vertices.min(axis=0))) or 1.0
+        distance = (self.vertices - point) @ normal
+        side = np.where(np.abs(distance) <= 1e-7 * scale, 0, np.sign(distance)).astype(np.int8)
+        corner_side = side[self.faces]
+        straddling = np.nonzero((corner_side.max(axis=1) > 0) & (corner_side.min(axis=1) < 0))[0]
+        if len(straddling) == 0:
+            return None
+        faces = self.faces[straddling]
+        nxt = np.roll(faces, -1, axis=1)
+        crossing = side[faces] * side[nxt] < 0                      # Kante k (Ecke k → k+1) geht durch die Ebene
+        count = len(self.vertices)
+        keys = np.minimum(faces, nxt) * count + np.maximum(faces, nxt)
+        # Nachbarschaft der geschnittenen Dreiecke: gemeinsame geschnittene Kante oder gemeinsame Ecke auf der Ebene
+        links = []
+        local = np.repeat(np.arange(len(straddling)), 3).reshape(-1, 3)
+        for owner_keys in (np.where(crossing, keys, -1), np.where(side[faces] == 0, faces, -1)):
+            flat, who = owner_keys.ravel(), local.ravel()
+            used = flat >= 0
+            flat, who = flat[used], who[used]
+            order = np.argsort(flat, kind="stable")
+            flat, who = flat[order], who[order]
+            same = flat[1:] == flat[:-1]
+            links.append(np.stack([who[:-1][same], who[1:][same]], axis=1))
+        pairs = np.concatenate(links) if links else np.zeros((0, 2), np.int64)
+        graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])), shape=(len(straddling),) * 2)
+        _count, label = connected_components(graph, directed=False)
+        # Anfang: das Dreieck mit dem Schnittpunkt, der der Stelle am nächsten liegt
+        a, b = faces[crossing], nxt[crossing]
+        t = distance[a] / (distance[a] - distance[b])
+        hits = self.vertices[a] + (self.vertices[b] - self.vertices[a]) * t[:, None]
+        owners = np.nonzero(crossing)[0]
+        seed = owners[np.argmin(np.linalg.norm(hits - point, axis=1))]
+        ring = np.nonzero(label == label[seed])[0]
+        return distance, side, straddling[ring], crossing[ring]
+
+    def loop_preview(self, point, normal) -> np.ndarray:
+        """Linienstücke (2k × 3) der Schleife, die ein Schnitt an dieser Ebene erzeugen würde – die gelbe Vorschau."""
+        found = self._loop_cut_plane(point, normal)
+        if found is None:
+            return np.zeros((0, 3), np.float32)
+        distance, side, ring, crossing = found
+        faces = self.faces[ring]
+        nxt = np.roll(faces, -1, axis=1)
+        a, b = faces, nxt
+        t = np.where(crossing, distance[a] / np.where(crossing, distance[a] - distance[b], 1.0), 0.0)
+        points = self.vertices[a] + (self.vertices[b] - self.vertices[a]) * t[..., None]   # F × 3 × 3
+        # je Dreieck die beiden Endpunkte: geschnittene Kanten bzw. die Ecke, die auf der Ebene liegt
+        on_plane = (side[faces] == 0)
+        ends = np.where((crossing | on_plane)[..., None], points, np.nan)
+        segments = []
+        for row in ends:
+            chosen = row[~np.isnan(row[:, 0])]
+            if len(chosen) >= 2:
+                segments.append(chosen[:2])
+        return np.asarray(segments, dtype=np.float32).reshape(-1, 3)
+
+    def loop_cut(self, point, normal) -> int:
+        """Schneidet eine Schleife neuer Ecken längs der Ebene ins Netz (siehe `_loop_cut_plane`); jedes geschnittene
+        Dreieck wird ohne Lücken oder T-Stöße zerlegt. Rückgabe: Zahl der neuen Ecken (0: an der Stelle nichts)."""
+        found = self._loop_cut_plane(point, normal)
+        if found is None:
+            return 0
+        distance, _side, ring, crossing_ring = found
+        count = len(self.vertices)
+        if len(self.faces) + 2 * len(ring) > MAX_TRIANGLES:
+            raise FeatureError(f"Mehr als {MAX_TRIANGLES:,} Dreiecke würden das Formen zu träge machen".replace(",", "."))
+        faces = self.faces
+        nxt = np.roll(faces, -1, axis=1)
+        keys = np.minimum(faces, nxt) * count + np.maximum(faces, nxt)
+        is_split = np.zeros(faces.shape, dtype=bool)
+        is_split[ring] = crossing_ring
+        chosen = np.unique(keys[is_split])
+        a, b = chosen // count, chosen % count
+        t = (distance[a] / (distance[a] - distance[b]))[:, None]
+        vertices = np.concatenate([self.vertices, self.vertices[a] + (self.vertices[b] - self.vertices[a]) * t])
+        mask = np.concatenate([self.mask, self.mask[a] + (self.mask[b] - self.mask[a]) * t[:, 0]])
+        middle = np.where(is_split, count + np.searchsorted(chosen, keys), -1)
+        self.__init__(vertices, _split_faces(faces, is_split, middle), mask)
+        return len(chosen)
+
+    def loop_cuts(self, a: int, b: int, cuts: int, slide: float = 0.0) -> int:
+        """`cuts` parallele Schleifen quer zur Kante a–b (wie Blender: gleichmäßig, gemeinsam verschiebbar).
+        Die Ebenen stehen senkrecht auf der Kante; Kante und Ecken a, b bleiben beim Schneiden erhalten, deshalb
+        treffen auch die späteren Schnitte (auf dem schon geteilten Netz) dieselbe Kante."""
+        start, end = self.vertices[a].copy(), self.vertices[b].copy()
+        direction = end - start
+        if np.linalg.norm(direction) < 1e-12:
+            return 0
+        added = 0
+        for position in self.loop_positions(cuts, slide):
+            added += self.loop_cut(start + direction * position, direction)
+        return added
+
+    def loop_cuts_preview(self, a: int, b: int, cuts: int, slide: float = 0.0) -> np.ndarray:
+        """Vorschau aller Schleifen von `loop_cuts` als Linienstücke."""
+        start, end = self.vertices[a], self.vertices[b]
+        direction = end - start
+        parts = [self.loop_preview(start + direction * position, direction)
+                 for position in self.loop_positions(cuts, slide)]
+        return np.concatenate(parts) if parts else np.zeros((0, 3), np.float32)
+
+    def wire_edges(self) -> np.ndarray:
+        """Alle Kanten einmal (E × 2 Eckennummern) – für die Netzansicht (Drahtgitter) beim Formen. Gemerkt je
+        Topologie: beim Formen bewegen sich nur die Ecken."""
+        cached = getattr(self, "_wire_cache", None)
+        if cached is not None and cached[0] == self.topology:
+            return cached[1]
+        f = self.faces
+        edges = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
+        edges = np.unique(edges, axis=0)
+        self._wire_cache = (self.topology, edges)
+        return edges
 
     # --- Speichern ------------------------------------------------------------------------------------------
 
@@ -343,6 +516,33 @@ class SculptMesh:
         if len(faces) != count_f:
             raise FeatureError("Die gespeicherte Form ist beschädigt")
         return cls(vertices.astype(np.float64), faces.astype(np.int64))
+
+
+def _split_faces(faces: np.ndarray, is_split: np.ndarray, middle: np.ndarray) -> np.ndarray:
+    """Zerlegt Dreiecke nach der Zahl ihrer geteilten Kanten („Rot-Grün“-Teilung, ohne Lücken oder T-Stöße).
+    `is_split` (F × 3): Kante k (Ecke k → k+1) wird geteilt; `middle` (F × 3): Nummer der neuen Ecke darauf.
+    Eine geteilte Kante: in zwei, zwei: in drei, drei: in vier Dreiecke; die Umlaufrichtung bleibt erhalten."""
+    splits = is_split.sum(axis=1)
+    pieces = [faces[splits == 0]]
+    # eine geteilte Kante k (p→q, Mitte m, gegenüber r): (p, m, r), (m, q, r)
+    one = np.nonzero(splits == 1)[0]
+    k = is_split[one].argmax(axis=1)
+    p_, q_, r_ = faces[one, k], faces[one, (k + 1) % 3], faces[one, (k + 2) % 3]
+    m_ = middle[one, k]
+    pieces += [np.stack([p_, m_, r_], 1), np.stack([m_, q_, r_], 1)]
+    # zwei geteilte Kanten: die ungeteilte u (a→b), dann b→c mit Mitte m1, c→a mit Mitte m2
+    two = np.nonzero(splits == 2)[0]
+    u = (~is_split[two]).argmax(axis=1)
+    a2, b2, c2 = faces[two, u], faces[two, (u + 1) % 3], faces[two, (u + 2) % 3]
+    m1, m2 = middle[two, (u + 1) % 3], middle[two, (u + 2) % 3]
+    pieces += [np.stack([a2, b2, m1], 1), np.stack([a2, m1, m2], 1), np.stack([m2, m1, c2], 1)]
+    # drei geteilte Kanten: vier Dreiecke wie beim Unterteilen
+    three = np.nonzero(splits == 3)[0]
+    a3, b3, c3 = faces[three, 0], faces[three, 1], faces[three, 2]
+    ab, bc, ca = middle[three, 0], middle[three, 1], middle[three, 2]
+    pieces += [np.stack([a3, ab, ca], 1), np.stack([ab, b3, bc], 1), np.stack([ca, bc, c3], 1),
+               np.stack([ab, bc, ca], 1)]
+    return np.concatenate(pieces)
 
 
 def voxel_remesh(mesh: "SculptMesh", size: float) -> "SculptMesh":

@@ -36,7 +36,12 @@ Voraussetzungen: 64-Bit-System, Grafik mit OpenGL 3.3, unter Linux glibc ≥ 2.2
 - **Zahnräder:** Evolventenverzahnung aus Modul, Zähnezahl und Eingriffswinkel – Stirnrad, schräg- und
   pfeilverzahnt, Hohlrad und Zahnstange, mit Bohrung und Flankenspiel.
 - **Formen (Sculpting):** Netze mit Pinseln wie in Blender formen (Zeichnen, Greifen, Glätten, Maske, Symmetrie,
-  Neu vernetzen, dynamische Topologie).
+  Neu vernetzen, dynamische Topologie). Schleifenschnitt wie in Blender (Strg+R, Mausrad für mehrere Schnitte,
+  danach schieben; Knopf ganz oben im Formen-Feld und im Reiter NETZ) und eine zuschaltbare Netzansicht.
+- **Schaltplan:** eigener Reiter mit Bibliothek (DIN-Schaltzeichen: passive Bauteile, Dioden, Transistoren,
+  MOSFETs, Operationsverstärker, Regler, ICs, Schalter, Relais, Steckverbinder, Netzsymbole). Leitungen werden
+  rechtwinklig gezogen und dehnen sich beim Verschieben mit. Netzlabels, elektrische Prüfung (ERC), Ausgabe als
+  Netzliste, Stückliste (CSV), SPICE, PDF, SVG und Bild. Der Schaltplan wird mit dem Entwurf gespeichert.
 - **Flächen, Blech und Netze:** Flächenwerkzeuge, Blech mit Abwicklung und Zuschnitt (DXF), Netze reparieren,
   glätten, schneiden und in Volumenkörper umwandeln.
 - **Baugruppen:** Komponenten, Gelenke, starre Gruppen, Kollisionsprüfung.

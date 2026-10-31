@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Schaltplan (Runde 98): Widerstand und LED mit Leitung -->
+<path d="M3 16h4M15 16h3" stroke="#7bd88f"/><rect x="7" y="13" width="8" height="6" stroke="#d6dbe4"/><path d="M18 11v10l8-5z" stroke="#d6dbe4"/><path d="M26 11v10M26 16h3" stroke="#d6dbe4"/><path d="M22 7l3-3M25 9l3-3" stroke="#f0c040" stroke-width="1.5"/>
+</svg>

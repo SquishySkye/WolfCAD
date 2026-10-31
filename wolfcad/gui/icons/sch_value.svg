@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Wert: Bauteilwert ändern (10k) -->
+<path d="M5 9l2-2v16M5 23h4M14 7h3a3 3 0 0 1 3 3v10a3 3 0 0 1-3 3h-3a3 3 0 0 1-3-3V10a3 3 0 0 1 3-3z" stroke="#d6dbe4"/><path d="M23 7v16M23 17l5-6M24.5 15l4 8" stroke="#f0c040"/>
+</svg>

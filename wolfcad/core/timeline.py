@@ -154,6 +154,9 @@ class Timeline:
         self.parameter_errors: dict[str, str] = {}
         # Zustand der Ansicht, der mit dem Entwurf gespeichert wird (z. B. ausgeblendete Körper)
         self.view_state: dict = {}
+        # Schaltplan des Entwurfs (Runde 98, Reiter „Schaltplan“): Daten von electronics.schematic.Schematic.to_dict;
+        # gehört zur Datei, aber nicht zum Bauverlauf (Rückgängig im 3D-Entwurf lässt ihn stehen)
+        self.schematic: dict = {}
         self.geometry_level = GEOMETRY_LEVEL     # neue Entwürfe rechnen nach dem aktuellen Verfahren
         # Modellstand vor jedem aktiven Feature (Index wie in `features`), für schnelles Weiterrechnen
         self._before: list[BuildState] = []
@@ -557,6 +560,8 @@ class Timeline:
             "ansicht": dict(self.view_state),
             "geometrie": self.geometry_level,
             "features": [self._step_dict(f) for f in self.features],
+            # nur mit Inhalt: Entwürfe ohne Schaltplan bleiben Wort für Wort wie bisher
+            **({"schaltplan": self.schematic} if self.schematic else {}),
         }
 
     @staticmethod
@@ -584,6 +589,7 @@ class Timeline:
                 feature._geometrie = int(level)
         timeline.parameters = dict(document.get("parameters", {}))     # ältere Dateien haben keine
         timeline.view_state = dict(document.get("ansicht", {}))
+        timeline.schematic = dict(document.get("schaltplan", {}))      # ältere Dateien: kein Schaltplan
         timeline.geometry_level = int(document.get("geometrie", 1))    # ältere Dateien: bisheriges Verfahren
         timeline.marker = max(0, min(document.get("marker", len(timeline.features)),
                                      len(timeline.features)))

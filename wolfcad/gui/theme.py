@@ -266,6 +266,16 @@ QWidget#operationBar {{ background: {c['surface']}; border: 1px solid {c['outlin
 
 _current: Theme = _CLASSIC
 
+_NEUTRAL_BODY = "#a4a7ac"       # neutrales Grau, auf dem Licht und Netzlinien gut zu lesen sind (wie Blenders Sculpt-Grau)
+
+
+def mesh_body_colour() -> Colour:
+    """Farbe des Netzes beim Formen und der Importkörper: Grau. Im Design „System“ mit einem Hauch der zweiten
+    Betriebssystemfarbe, damit es zum Rest passt; die Hauptfarbe wäre als ganze Fläche zu grell und hielte Lichter
+    und Netzlinien schlechter sichtbar."""
+    colours = _current.extra.get("colours")
+    return _rgb(_mix(_NEUTRAL_BODY, colours["second"], 0.22) if colours else _NEUTRAL_BODY)
+
 
 def watched_files() -> list[Path]:
     """Dateien, deren Änderung das Design „System“ betrifft (soweit vorhanden)."""

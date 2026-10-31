@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Netz (Leitung zeichnen): rechtwinklige Leitung mit Verbindungspunkt -->
+<path d="M4 24h10V8h14" stroke="#7bd88f"/><path d="M14 16h10" stroke="#7bd88f"/><circle cx="14" cy="16" r="2.2" fill="#7bd88f" stroke="none"/>
+</svg>

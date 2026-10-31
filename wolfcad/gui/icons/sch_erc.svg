@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Elektrische Prüfung (ERC): Haken im Schild -->
+<path d="M16 3l11 4v8c0 7-5 12-11 14C10 27 5 22 5 15V7z" stroke="#d6dbe4"/><path d="M11 16l4 4 7-8" stroke="#7bd88f"/>
+</svg>

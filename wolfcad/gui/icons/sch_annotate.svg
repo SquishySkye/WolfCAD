@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+<!-- Neu nummerieren: R1 R2 R3 der Reihe nach -->
+<path d="M4 8h6M4 16h6M4 24h6" stroke="#d6dbe4"/><path d="M15 6l2-1v6M15 11h4M14 14h3a2 2 0 0 1 0 4h-1l3 0M14 18h5M14 22h4l-2 3a2 2 0 1 1-2 2" stroke="#f0c040" stroke-width="1.6"/><path d="M24 8v18l3-3M24 26l-3-3" stroke="#4fc3f7"/>
+</svg>

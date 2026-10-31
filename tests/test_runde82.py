@@ -145,10 +145,11 @@ def test_fusion_boolean_only_touches_participants():
 # --- Clips der Erklärkarten ----------------------------------------------------------------------------------------
 
 # Befehle ohne Vorführung im Modell (Datei, Programm, Ansicht) – alle übrigen Werkzeuge haben ein Video
-WITHOUT_CLIP = {"Neu", "Öffnen", "Speichern", "Import", "Zeichnung", "Export", "3D-Druck", "Rückgängig", "Wiederholen",
+WITHOUT_CLIP = {"Schleifenschnitt", "Neu", "Öffnen", "Speichern", "Import", "Zeichnung", "Export", "3D-Druck", "Rückgängig", "Wiederholen",
                 "Physisches Material", "Alle berechnen", "Parameter", "Netz einfügen", "Netz als STL speichern",
                 "Zuschnitt (DXF)", "DXF/SVG einfügen", "Eigenschaften", "Einpassen", "Raster", "Einstellungen",
-                "Abspielen", "Hilfskörper", "Ansichten", "Über WolfCAD"}
+                "Abspielen", "Hilfskörper", "Ansichten", "Über WolfCAD",
+                "Schaltplan"}       # Runde 98: öffnet wie „3D-Druck“ nur einen eigenen Reiter (kein Modell-Clip)
 
 
 def test_every_tool_in_the_menus_has_a_clip():
